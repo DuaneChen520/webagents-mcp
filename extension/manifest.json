@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "WebAgents",
+  "version": "0.2.0",
+  "description": "把 DeepSeek / 通义千问等网页版聊天作为 subagent：接收本地 MCP 桥接的请求，注入 prompt 并抓取回复",
+  "permissions": ["tabs", "scripting", "storage", "alarms", "debugger"],
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "action": { "default_title": "WebAgents 设置", "default_popup": "popup.html" },
+  "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "https://www.qianwen.com/*",
+    "https://qianwen.com/*",
+    "https://chat.qianwen.com/*",
+    "https://www.tongyi.com/*",
+    "https://tongyi.aliyun.com/*",
+    "https://chat.aliyun.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content/common.js", "content/deepseek.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.qianwen.com/*", "https://qianwen.com/*", "https://chat.qianwen.com/*"],
+      "js": ["content/common.js", "content/qwen.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.tongyi.com/*", "https://tongyi.aliyun.com/*", "https://chat.aliyun.com/*"],
+      "js": ["content/common.js", "content/qwen.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
