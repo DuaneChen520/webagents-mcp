@@ -248,7 +248,11 @@
 
     async send(inputEl) {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      const sent = () => !(inputEl.innerText || '').trim(); // 输入框清空 = 已发送
+      // 实时重查活编辑器：发送成功后 SPA 跳会话页会重挂编辑器，旧引用 innerText 仍有全文（幽灵节点误报）
+      const sent = () => {
+        const live = document.querySelector('[contenteditable="true"]') || inputEl;
+        return !(live.innerText || '').trim(); // 输入框清空 = 已发送
+      };
 
       const findBtn = () => {
         for (const b of document.querySelectorAll('button, [role="button"]')) {
