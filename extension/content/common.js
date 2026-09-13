@@ -82,29 +82,19 @@
     }
   }
 
-  /** 用户气泡宽松检测：输入框之外出现以 prompt 开头的可见消息节点 */
-  function userBubbleSeen(prompt, inputEl) {
+  /**
+   * 发送成功等价信号（2026-09-14 修订）：
+   * 1) 输入框已清空（textarea 站点最可靠信号；textarea.value 不计入 body.innerText）
+   * 2) 页面正文出现以 prompt 开头的文本（气泡；不依赖类名，兼容哈希类名站点）
+   * contenteditable 站点输入框文本会出现在 body.innerText 里，先用「仍在输入框」排除。
+   */
+  function verifySentDefault(inputEl, prompt) {
+    const inBox = normalizeText(readInputDefault(inputEl));
+    if (!inBox) return true;
     const head = normalizeText(prompt).slice(0, 30);
     if (!head) return false;
-    let nodes = [];
-    try {
-      nodes = document.querySelectorAll(
-        '[class*="user" i], [class*="question" i], [class*="message" i], [class*="bubble" i], [class*="request" i]',
-      );
-    } catch { return false; }
-    for (const n of nodes) {
-      if (inputEl && (n === inputEl || n.contains(inputEl) || inputEl.contains(n))) continue;
-      if (!(n.offsetParent !== null || n.getClientRects().length > 0)) continue;
-      const t = normalizeText(n.innerText || '');
-      if (t.startsWith(head)) return true;
-    }
-    return false;
-  }
-
-  /** 发送成功等价信号：输入框被清空，或出现用户消息气泡 */
-  function verifySentDefault(inputEl, prompt) {
-    if (!normalizeText(readInputDefault(inputEl))) return true;
-    return userBubbleSeen(prompt, inputEl);
+    if (inBox.includes(head)) return false;
+    try { return (document.body.innerText || '').includes(head); } catch { return false; }
   }
 
   /** 回答区原始块数（含未出文本的块），供「新增节点」式生命信号比对 */
@@ -156,6 +146,26 @@
         out.sendCandidates.push({ tag: el.tagName, id: el.id, cls: cls.slice(0, 120), label });
       }
     });
+    // 输入栏按钮全量清单（哈希类名站点 send/发送 标记缺失时用）：纵向距输入框 180px 内的可见按钮
+    const anchor = document.querySelector('textarea, [contenteditable="true"]');
+    if (anchor) {
+      const ay = anchor.getBoundingClientRect().y;
+      out.barButtons = [];
+      document.querySelectorAll('button, [role="button"]').forEach((el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) return;
+        if (Math.abs(r.y - ay) > 180) return;
+        if (!(el.offsetParent !== null || el.getClientRects().length > 0)) return;
+        out.barButtons.push({
+          tag: el.tagName, id: el.id || '', cls: String(el.className).slice(0, 100),
+          label: el.getAttribute('aria-label') || el.getAttribute('title') || '',
+          text: (el.innerText || '').trim().slice(0, 16), svg: !!el.querySelector('svg'),
+          disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+          x: Math.round(r.x), y: Math.round(r.y),
+        });
+      });
+      out.barButtons.sort((a, b) => b.x - a.x);
+    }
     // 选项开关：按叶子节点文本全量扫描（不限标签/role，覆盖裸 DIV 开关）
     const seen = new Set();
     document.querySelectorAll('body *').forEach((el) => {
@@ -231,10 +241,11 @@
             }
             stage = 'send';
             const how = await ADAPTER.send(input);
-            const sentOk = await verifyWithin(5000, () =>
+            const sentOk = await verifyWithin(8000, () =>
               (ADAPTER.verifySent ? ADAPTER.verifySent(input, msg.prompt) : verifySentDefault(input, msg.prompt)));
             if (!sentOk) {
-              sendResponse({ ok: false, stage: 'send', detail: `发送动作(${how})后 5s 内未见输入框清空或用户消息气泡` });
+              const still = normalizeText(readInputDefault(input)).slice(0, 40) || '(空)';
+              sendResponse({ ok: false, stage: 'send', detail: `发送动作(${how})后 8s 未见发送信号，输入框残留「${still}」` });
               return;
             }
             // 回传首反馈判定基线：发送完成瞬间的回答块数与思考态指示器
