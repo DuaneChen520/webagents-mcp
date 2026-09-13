@@ -4,7 +4,7 @@
  * 职责：
  * 1. 维持与本地 WS 桥接（ws://127.0.0.1:8765）的连接，掉线自动重连
  * 2. 接收 request{action, site, prompt...}，路由到对应站点的 content script 适配器
- * 3. 管理每站一个专属（pinned）标签页：不存在则创建；已存在则原地唤醒复用当前会话（不导航）
+ * 3. 管理每站一个专属（pinned）标签页：不存在则创建；每次 ask 先归位站点首页（独立全新会话）再派发
  *
  * 注意：内容脚本负责页面内的等待与抓取；SW 只做路由。WS 心跳保持 SW 存活。
  */
@@ -126,12 +126,12 @@ async function ensureTab(site) {
     tab = await chrome.tabs.create({ url: cfg.url, pinned: true, active: false });
     try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (err) { console.log(`[webagents] ${site} 防休眠设置失败: ${err.message}`); }
   } else {
-    // 唤醒休眠标签页 + 防止被 Edge 休眠；不导航（保留当前会话，2026-09-14 去掉“归位首页”）
+    // 唤醒休眠标签页 + 防止被 Edge 休眠 + 归位首页（每次 ask 独立全新会话，防上下文污染）
     try {
-      if (tab.discarded) await chrome.tabs.reload(tab.id); // 丢弃态先原地唤醒，保持会话 URL
+      await chrome.tabs.update(tab.id, { url: cfg.url, active: false });
       try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (err2) { console.log(`[webagents] ${site} 防休眠设置失败: ${err2.message}`); }
     } catch (err) {
-      console.log(`[webagents] ${site} 标签页唤醒失败 tabId=${tab.id}: ${err.message}`);
+      console.log(`[webagents] ${site} 标签页归位失败 tabId=${tab.id}: ${err.message}`);
     }
   }
 
@@ -146,8 +146,25 @@ async function ensureTab(site) {
       r = await chrome.tabs.sendMessage(tab.id, { type: 'ping' });
     } catch (err) { lastErr = err.message; }
     if (r && r.ready) {
-      // 不做归位校验/残留刷新（会打断会话）；旧回复误判由 ask 阶段的基线块数守卫处理
-      return tab.id;
+      // 归位校验（2026-09-14 修复竞态）：必须精确在首页——旧对话页 URL 同样以站点域名开头，
+      // 旧的 startsWith 判定永远为 true，导致消息发进旧会话后导航才生效、回复丢失。
+      let cur = null;
+      try { cur = await chrome.tabs.get(tab.id); } catch {}
+      const path = String((cur && cur.url) || '').split('?')[0].split('#')[0];
+      const onHome = path === cfg.url;
+      let st = null;
+      try { st = await chrome.tabs.sendMessage(tab.id, { type: 'state' }); } catch {}
+      const stale = st && st.ok && st.count > 0;
+      if ((!onHome || stale) && reloads < 3) {
+        reloads++;
+        console.log(`[webagents] ${site} 未归位(onHome=${onHome} url=${path})或残留回复(${stale ? st.count : 0}块)，刷新归位`);
+        try { await chrome.tabs.update(tab.id, { url: cfg.url, active: false }); } catch {}
+        injected = false;
+        await sleep(2000);
+        continue;
+      }
+      if (onHome && !stale) return tab.id;
+      if (reloads >= 3) return tab.id; // 兜底：多次归位失败也放行，由 ask 阶段基线守卫兜住
     }
 
     if (i === 5 || i === 29) {
@@ -178,7 +195,7 @@ async function ensureTab(site) {
 }
 
 // ---- 请求路由 ----
-const SW_VERSION = '5'; // v5: 会话复用（去掉每次归位首页），基线块数守卫防旧回复误判
+const SW_VERSION = '6'; // v6: 恢复每次归位首页（独立会话），归位校验改精确 URL 匹配修复竞态；保留基线块数守卫
 async function handleRequest(msg) {
   const { id, action } = msg;
   const stamp = (r) => Object.assign({ sw: SW_VERSION }, r);
