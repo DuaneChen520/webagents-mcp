@@ -83,13 +83,15 @@
   }
 
   /**
-   * 发送成功等价信号（2026-09-14 修订）：
+   * 发送成功等价信号（2026-09-14 修订 2）：
    * 1) 输入框已清空（textarea 站点最可靠信号；textarea.value 不计入 body.innerText）
    * 2) 页面正文出现以 prompt 开头的文本（气泡；不依赖类名，兼容哈希类名站点）
-   * contenteditable 站点输入框文本会出现在 body.innerText 里，先用「仍在输入框」排除。
+   * 注意：发送成功后站点 SPA 跳转会话页会重挂 textarea，必须实时重查活的输入框，
+   * 不能用 ask 时捕获的旧引用（游离节点的 value 仍含全文，会造成"假失败"误报）。
    */
   function verifySentDefault(inputEl, prompt) {
-    const inBox = normalizeText(readInputDefault(inputEl));
+    const live = document.querySelector('textarea, [contenteditable="true"]') || inputEl;
+    const inBox = normalizeText(readInputDefault(live));
     if (!inBox) return true;
     const head = normalizeText(prompt).slice(0, 30);
     if (!head) return false;
