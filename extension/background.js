@@ -283,8 +283,6 @@ async function handleRequest(msg) {
       }
 
       let gotSignal = !ack; // ack 丢失路径已在上方窗口确认过信号
-      // 会话复用守卫：不再导航归位后，页面可能带旧回复；必须等到基线之外的新回答块才判完成
-      let newBlockSeen = !ack;
       let noSignalMs = 0;
       while (true) {
         const loopStart = Date.now();
@@ -300,7 +298,6 @@ async function handleRequest(msg) {
           continue; // 页面跳转中（content script 重建），不计入首反馈窗口，下一轮再取
         }
         if (!st || !st.ok) continue;
-        if (typeof st.blocks === 'number' && st.blocks > baseBlocks) newBlockSeen = true;
 
         // 首反馈校验（≤firstSignalMs）：发送成功后回复区必须出现任一生命信号，否则立即报错
         if (!gotSignal) {
@@ -321,7 +318,8 @@ async function handleRequest(msg) {
 
         const { count, text } = st;
         const now = Date.now();
-        if (newBlockSeen && count > 0 && text && text === lastText && count === lastCount) {
+        // v6 隔离后每次 ask 均从干净首页开始，无旧回复残留，无需基线块数守卫
+        if (count > 0 && text && text === lastText && count === lastCount) {
           if (!stableSince) stableSince = now;
           if (now - stableSince >= 400) {
             await sleep(300); // 复确认
