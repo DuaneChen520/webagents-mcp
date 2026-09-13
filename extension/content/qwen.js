@@ -291,7 +291,21 @@
       await sleep(2000);
       if (sent()) return 'enter-retry';
 
-      throw new Error('发送失败：按钮不可用且 Enter 无效');
+      // 诊断快照：按钮状态 + 活编辑器内容 + 当前 URL（发送失败时定位判定问题用）
+      const diag = () => {
+        const live = document.querySelector('[contenteditable="true"]');
+        const all = [...document.querySelectorAll('[contenteditable="true"]')];
+        const b = findBtn();
+        return [
+          `按钮:${b ? '找到可用' : '未找到可用'}`,
+          `编辑器数:${all.length}`,
+          `live#${all.indexOf(live)}内容:「${live ? (live.innerText || '').slice(0, 50) : 'N/A'}」`,
+          `旧引用内容:「${(inputEl.innerText || '').slice(0, 50)}」`,
+          `URL:${location.pathname}`,
+        ].join(' | ');
+      };
+
+      throw new Error(`发送失败：按钮不可用且 Enter 无效 | ${diag()}`);
     },
   };
 
