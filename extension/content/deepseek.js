@@ -12,6 +12,9 @@
     site: 'deepseek',
     input: 'textarea',
     answer: '.ds-markdown.ds-assistant-message-main-content',
+    // 思考态/生成中指示器（首反馈校验用，宽松策略待 probe 校准）：
+    // 深度思考时出现思考内容块（.ds-think-*）；另有 common.js 跨站兜底（loading/停止按钮等）
+    thinkingSel: ['.ds-think-content', '[class*="ds-think" i]'],
 
     /**
      * 对话选项开关（2026-09-13 Playwright 实测 DOM）：

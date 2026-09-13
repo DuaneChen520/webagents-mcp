@@ -18,6 +18,9 @@
       '[class*="msg-content"]',
       '[class*="answer"] [class*="content"]',
     ],
+    // 思考态/生成中指示器（首反馈校验用，宽松策略待 probe 校准）：
+    // 思考模式出现「思考中」指示/思考内容块；另有 common.js 跨站兜底（loading/停止按钮等）
+    thinkingSel: ['[class*="think" i]'],
 
     /**
      * 对话模式切换（2026-09-13 二次 probe 实测 DOM）：

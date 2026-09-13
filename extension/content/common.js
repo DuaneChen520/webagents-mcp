@@ -1,6 +1,12 @@
 /**
  * content script 公共层：消息接线 + 通用问答/探测逻辑
  * 各站点适配器只需提供 SELECTORS 与 send() 实现，调用 wire(ADAPTER) 即可。
+ *
+ * 分级 fail-fast（2026-09-13）：
+ *   stage='inject'           注入后 ≤3s 读回编辑器内容比对（最多尝试 2 次）
+ *   stage='send'             触发发送后 ≤5s 确认等价信号（输入框清空/用户气泡出现）
+ *   stage='no_site_feedback' 由 background 轮询 state（feedback/blocks 生命信号）判定，≤12s
+ * 每级失败立即以 {ok:false, stage, detail} 回传 background → server → MCP，绝不静默挂起。
  */
 /* eslint-disable no-undef */
 (() => {
@@ -51,6 +57,80 @@
       await sleep(300);
     }
     throw new Error(`等待元素超时: ${selector}`);
+  }
+
+  /** 归一化：去零宽字符与首尾空白（注入读回比对用） */
+  function normalizeText(s) {
+    return String(s || '').replace(/[\u200B\u200C\u200D\uFEFF]/g, '').trim();
+  }
+
+  /** 读回编辑器当前内容：textarea/input 读 value，contenteditable 读 innerText */
+  function readInputDefault(el) {
+    if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value || '';
+    return el.innerText || '';
+  }
+
+  /** 时限内轮询断言，成立返回 true（fail-fast 校验用） */
+  async function verifyWithin(timeoutMs, fn, stepMs = 200) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let v = false;
+      try { v = (await fn()) === true; } catch { v = false; }
+      if (v) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(stepMs);
+    }
+  }
+
+  /** 用户气泡宽松检测：输入框之外出现以 prompt 开头的可见消息节点 */
+  function userBubbleSeen(prompt, inputEl) {
+    const head = normalizeText(prompt).slice(0, 30);
+    if (!head) return false;
+    let nodes = [];
+    try {
+      nodes = document.querySelectorAll(
+        '[class*="user" i], [class*="question" i], [class*="message" i], [class*="bubble" i], [class*="request" i]',
+      );
+    } catch { return false; }
+    for (const n of nodes) {
+      if (inputEl && (n === inputEl || n.contains(inputEl) || inputEl.contains(n))) continue;
+      if (!(n.offsetParent !== null || n.getClientRects().length > 0)) continue;
+      const t = normalizeText(n.innerText || '');
+      if (t.startsWith(head)) return true;
+    }
+    return false;
+  }
+
+  /** 发送成功等价信号：输入框被清空，或出现用户消息气泡 */
+  function verifySentDefault(inputEl, prompt) {
+    if (!normalizeText(readInputDefault(inputEl))) return true;
+    return userBubbleSeen(prompt, inputEl);
+  }
+
+  /** 回答区原始块数（含未出文本的块），供「新增节点」式生命信号比对 */
+  function blockCount(ADAPTER) {
+    for (const sel of ADAPTER.answerList || [ADAPTER.answer]) {
+      let n = 0;
+      try { n = document.querySelectorAll(sel).length; } catch { /* 选择器非法忽略 */ }
+      if (n) return n;
+    }
+    return 0;
+  }
+
+  /** 思考态/生成中指示器：适配器 thinkingSel 优先，另附跨站宽松兜底 */
+  const FEEDBACK_FALLBACK_SEL = [
+    '[class*="thinking" i]', '[class*="loading" i]', '[class*="spinner" i]',
+    '[class*="generating" i]', '[aria-label*="停止"]', '[aria-label*="stop" i]',
+  ];
+  function siteFeedback(ADAPTER) {
+    for (const sel of [...(ADAPTER.thinkingSel || []), ...FEEDBACK_FALLBACK_SEL]) {
+      let els = [];
+      try { els = document.querySelectorAll(sel); } catch { continue; }
+      for (const el of els) {
+        if (el.offsetParent !== null || el.getClientRects().length > 0) return sel;
+      }
+    }
+    return null;
   }
 
   /** DOM 探测：站点改版时用于修正选择器 */
@@ -106,6 +186,9 @@
   }
 
   function wire(ADAPTER) {
+    // 防 manifest 声明注入 + 程序化 executeScript 补注入导致监听器重复注册（'ask' 会被处理两次）
+    if (window.__WEBAGENTS_WIRED__) return;
+    window.__WEBAGENTS_WIRED__ = true;
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       (async () => {
         if (msg.type === 'ping') {
@@ -117,15 +200,47 @@
           return;
         }
         if (msg.type === 'ask') {
-          // 立即返回：不做长等待（页面可能整页跳转，长等待必须在 SW 侧轮询）
+          // 分级校验：inject（读回比对 ≤3s×2 次）→ send（等价信号 ≤5s）；每级失败立即回传，绝不静默重试
+          let stage = 'inject';
           try {
-            const input = await waitFor(ADAPTER.input);
-            if (msg.options && ADAPTER.setOptions) await ADAPTER.setOptions(msg.options, input);
-            await (ADAPTER.setValue ? ADAPTER.setValue(input, msg.prompt) : setInputValue(input, msg.prompt));
+            let input;
+            try {
+              input = await waitFor(ADAPTER.input, 2500);
+            } catch {
+              sendResponse({ ok: false, stage: 'inject', detail: `未找到输入框（${ADAPTER.input}），页面可能未加载完成或未登录` });
+              return;
+            }
+            if (msg.options && ADAPTER.setOptions) {
+              stage = 'options';
+              await ADAPTER.setOptions(msg.options, input);
+              stage = 'inject';
+            }
+            const readBack = () => normalizeText(ADAPTER.readInput ? ADAPTER.readInput(input) : readInputDefault(input));
+            const want = normalizeText(msg.prompt);
+            let injected = false;
+            let injectDetail = '';
+            for (let attempt = 1; attempt <= 2 && !injected; attempt++) {
+              await (ADAPTER.setValue ? ADAPTER.setValue(input, msg.prompt) : setInputValue(input, msg.prompt));
+              // 注入校验：读回编辑器内容与预期一致（3s 内确认，编辑器回显可能略滞后）
+              if (await verifyWithin(3000, () => readBack() === want)) { injected = true; break; }
+              injectDetail = `读回「${readBack().slice(0, 80) || '(空)'}」≠ 预期「${want.slice(0, 80)}」`;
+            }
+            if (!injected) {
+              sendResponse({ ok: false, stage: 'inject', detail: `注入校验失败（已尝试 2 次）：${injectDetail}` });
+              return;
+            }
+            stage = 'send';
             const how = await ADAPTER.send(input);
-            sendResponse({ ok: true, sent: how });
+            const sentOk = await verifyWithin(5000, () =>
+              (ADAPTER.verifySent ? ADAPTER.verifySent(input, msg.prompt) : verifySentDefault(input, msg.prompt)));
+            if (!sentOk) {
+              sendResponse({ ok: false, stage: 'send', detail: `发送动作(${how})后 5s 内未见输入框清空或用户消息气泡` });
+              return;
+            }
+            // 回传首反馈判定基线：发送完成瞬间的回答块数与思考态指示器
+            sendResponse({ ok: true, sent: how, baseBlocks: blockCount(ADAPTER), baseFeedback: siteFeedback(ADAPTER) });
           } catch (err) {
-            sendResponse({ ok: false, error: err.message });
+            sendResponse({ ok: false, stage, detail: err.message });
           }
           return;
         }
@@ -133,6 +248,8 @@
           const st = answerState(ADAPTER);
           sendResponse({
             ok: true, url: location.href, count: st.count, text: st.text, sel: st.sel,
+            blocks: blockCount(ADAPTER),
+            feedback: siteFeedback(ADAPTER),
             options: ADAPTER.optionState ? ADAPTER.optionState() : null,
           });
           return;

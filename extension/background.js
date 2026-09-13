@@ -122,11 +122,14 @@ async function ensureTab(site) {
   }
   let tab = tabs[0];
   if (!tab) {
-    tab = await chrome.tabs.create({ url: cfg.url, pinned: true, active: false, autoDiscardable: false });
+    // 注：部分 Edge 版本 tabs.create 不接受 autoDiscardable，创建后单独用 update 设置
+    tab = await chrome.tabs.create({ url: cfg.url, pinned: true, active: false });
+    try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (err) { console.log(`[webagents] ${site} 防休眠设置失败: ${err.message}`); }
   } else {
     // 唤醒休眠标签页 + 防止被 Edge 休眠 + 归位首页（全新会话）
     try {
-      await chrome.tabs.update(tab.id, { url: cfg.url, active: false, autoDiscardable: false });
+      await chrome.tabs.update(tab.id, { url: cfg.url, active: false });
+      try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (err2) { console.log(`[webagents] ${site} 防休眠设置失败: ${err2.message}`); }
     } catch (err) {
       console.log(`[webagents] ${site} 标签页归位失败 tabId=${tab.id}: ${err.message}`);
     }
@@ -189,7 +192,7 @@ async function ensureTab(site) {
 }
 
 // ---- 请求路由 ----
-const SW_VERSION = '3'; // v3: options 支持（deepseek deepThink/search，qwen mode）
+const SW_VERSION = '4'; // v4: ask 分级 fail-fast 校验（inject ≤3s×2 / send ≤5s / no_site_feedback ≤12s）
 async function handleRequest(msg) {
   const { id, action } = msg;
   const stamp = (r) => Object.assign({ sw: SW_VERSION }, r);
@@ -220,13 +223,23 @@ async function handleRequest(msg) {
         if (d.qwenMode) defaults.mode = d.qwenMode;
         if (Object.keys(defaults).length) effOptions = Object.assign({}, msg.options || {}, defaults);
       } catch { /* 存储不可用时按无默认处理 */ }
-      // 两段式：先触发发送（立即返回，容忍整页跳转），再由 SW 轮询页面状态直到回复稳定
-      let ack = null;
-      try {
-        ack = await chrome.tabs.sendMessage(tabId, { type: 'ask', prompt: msg.prompt, options: effOptions });
-      } catch {
-        // 发送瞬间页面可能已开始跳转，ack 丢失不算失败，继续轮询
+      // 两段式：先触发发送（容忍整页跳转），再由 SW 轮询页面状态直到回复稳定。
+      // content 侧已做 inject（读回比对 ≤3s×2 次）/ send（等价信号 ≤5s）分级校验，
+      // 这里只负责 no_site_feedback（≤12s）与回复稳定性判定。
+      // ack 兜底 60s：content 最坏合法路径（长文本逐字符注入×2 次 + 选项切换）可能 ~50s，
+      // 超时按 ack 丢失处理，绝不无限挂起等 sendMessage。
+      const ack = await Promise.race([
+        chrome.tabs.sendMessage(tabId, { type: 'ask', prompt: msg.prompt, options: effOptions }).catch(() => null),
+        sleep(60000).then(() => null),
+      ]);
+
+      // ack 显式失败 = content 校验已确认失败 → 立即把错误传回 server/MCP，绝不静默重试
+      if (ack && ack.ok === false) {
+        const stage = ack.stage || 'unknown';
+        const detail = ack.detail || ack.error || '未知错误';
+        return sendResult(id, stamp({ ok: false, stage, detail, error: `[${site}][${stage}] ${detail}` }));
       }
+
       // SW 侧超时上限 170s：早于 WS 桥 180s 上限返回，超时带出已生成的部分文本
       const timeoutMs = msg.timeoutMs || 170000;
       const deadline = Date.now() + timeoutMs;
@@ -234,24 +247,39 @@ async function handleRequest(msg) {
       let lastCount = 0;
       let stableSince = 0;
 
-      if (ack && ack.ok === false) {
-        // send 失败不立即判死：编辑器框架可能延迟处理，继续轮询 15s 看回复是否出现
-        const graceEnd = Date.now() + 15000;
-        let st = null;
-        while (Date.now() < graceEnd) {
-          await sleep(1500);
-          try { st = await chrome.tabs.sendMessage(tabId, { type: 'state' }); } catch { continue; }
-          if (st && st.ok && st.count > 0 && st.text) break;
+      // 首反馈判定基线（ack 成功时由 content 回传）：发送完成瞬间的回答块数与思考态指示器
+      const baseBlocks = (ack && ack.baseBlocks) || 0;
+      const baseFeedback = (ack && ack.baseFeedback) || null;
+      // 生命信号：回复文本出现 / 回答区新增节点 / 思考态或加载指示器（与基线对比）
+      const hasSignal = (st) => (st.count > 0 && !!st.text)
+        || (typeof st.blocks === 'number' && st.blocks > baseBlocks)
+        || (!!st.feedback && st.feedback !== baseFeedback);
+
+      if (!ack) {
+        // ack 丢失/超时（页面跳转或消息通道中断）：给 12s 首反馈窗口，无任何生命信号立即报错
+        const ackDeadline = Date.now() + 12000;
+        let st0 = null;
+        while (Date.now() < ackDeadline) {
+          await sleep(1200);
+          try { st0 = await chrome.tabs.sendMessage(tabId, { type: 'state' }); } catch { continue; }
+          if (st0 && ((st0.count > 0 && st0.text) || st0.feedback)) break;
         }
-        if (!(st && st.ok && st.count > 0 && st.text)) {
-          return sendResult(id, stamp(ack));
+        if (!(st0 && ((st0.count > 0 && st0.text) || st0.feedback))) {
+          return sendResult(id, stamp({
+            ok: false,
+            stage: 'no_site_feedback',
+            detail: 'ack 丢失且 12s 内无站点反馈，注入/发送未生效',
+            error: `[${site}][no_site_feedback] ack 丢失且 12s 内无站点反馈，注入/发送未生效`,
+          }));
         }
-        // 有回复了 → 进入下方的稳定性轮询，把 st 当作初始状态
-        lastText = st.text;
-        lastCount = st.count;
+        lastText = st0.text || '';
+        lastCount = st0.count || 0;
       }
 
+      let gotSignal = !ack; // ack 丢失路径已在上方窗口确认过信号
+      let noSignalMs = 0;
       while (true) {
+        const loopStart = Date.now();
         if (Date.now() > deadline) {
           return sendResult(id, stamp({ ok: true, text: lastText, timedOut: true }));
         }
@@ -261,9 +289,26 @@ async function handleRequest(msg) {
         try {
           st = await chrome.tabs.sendMessage(tabId, { type: 'state' });
         } catch {
-          continue; // 页面跳转中（content script 重建），下一轮再取
+          continue; // 页面跳转中（content script 重建），不计入首反馈窗口，下一轮再取
         }
         if (!st || !st.ok) continue;
+
+        // 首反馈校验（≤12s）：发送成功后回复区必须出现任一生命信号，否则立即报错
+        if (!gotSignal) {
+          if (hasSignal(st)) {
+            gotSignal = true;
+          } else {
+            noSignalMs += Date.now() - loopStart;
+            if (noSignalMs >= 12000) {
+              return sendResult(id, stamp({
+                ok: false,
+                stage: 'no_site_feedback',
+                detail: `发送后回复区 ${Math.round(noSignalMs / 1000)}s 内无生命信号（无流式文本/思考态/新增节点）`,
+                error: `[${site}][no_site_feedback] 发送后回复区 12s 内无生命信号（无流式文本/思考态/新增节点）`,
+              }));
+            }
+          }
+        }
 
         const { count, text } = st;
         const now = Date.now();
