@@ -49,15 +49,16 @@
     },
 
     async send(inputEl) {
-      // 优先点击发送按钮（圆形主色 ds-button）
+      // 优先点击发送按钮（主色圆形；2026-09-14 probe 实测已从 <button> 变为 <div>，故不加标签限定）
       const btn =
         document.querySelector('#send-message-button') ||
-        document.querySelector('button.ds-button--primary.ds-button--circle');
+        document.querySelector('.ds-button--primary.ds-button--circle');
       if (btn) {
         btn.click();
-        return 'click';
+        return 'click:' + String(btn.className).slice(0, 60);
       }
-      // 回退：模拟 Enter
+      // 回退：聚焦后模拟 Enter（部分站点仅响应聚焦目标上的按键）
+      inputEl.focus();
       inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
       inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
       return 'enter';
