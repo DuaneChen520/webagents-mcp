@@ -270,5 +270,5 @@
     });
   }
 
-  window.__WEBAGENTS__ = { wire, sleep, waitFor, setNativeValue, setInputValue, probe, answerState };
+  window.__WEBAGENTS__ = { wire, sleep, waitFor, setNativeValue, setInputValue, probe, answerState, normalizeText, readInputDefault };
 })();
