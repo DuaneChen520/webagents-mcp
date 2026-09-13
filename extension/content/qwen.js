@@ -250,6 +250,7 @@
 
       // 水合自愈：编辑器节点可能被框架异步重挂（注入文本随旧节点死亡）。
       // 注入后等 300ms 复查活编辑器：节点被换/活编辑器为空 → 对活节点重新注入，最多 3 轮。
+      ADAPTER.__lastText = text; // send 阶段活编辑器被水合清空时就地补注用
       let target = liveEl();
       for (let round = 0; round < 3; round++) {
         const how = await inject(target);
@@ -276,9 +277,12 @@
       // 占位符文本/输入框延迟清空/编辑器重挂全部免疫，比"输入框清空"可靠一个量级。
       const sent = () => location.pathname !== startPath;
 
-      // 入口守卫：活编辑器必须已有注入文本，防止对空编辑器点幽灵按钮
+      // 入口守卫：活编辑器为空时先就地补注（水合重挂可能吃掉注入文本），补注失败才报错
       if (isEmpty(live().innerText)) {
-        throw new Error('编辑器重挂，注入丢失（活编辑器为空）——请重试');
+        const reinject = await reinjectPrompt();
+        if (!reinject) {
+          throw new Error('编辑器重挂，注入丢失且补注失败（活编辑器为空）——请重试');
+        }
       }
 
       const findBtn = () => {
@@ -291,8 +295,33 @@
         return null;
       };
 
+      // 就地补注：显式选区 + execCommand insertText（与 setValue 主路径同款），成功以读回非空为准
+      async function reinjectPrompt() {
+        const text = ADAPTER.__lastText;
+        if (!text) return false;
+        const target = live();
+        target.focus();
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(target);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        await sleep(150);
+        document.execCommand('insertText', false, text);
+        await sleep(500);
+        return !isEmpty(live().innerText);
+      }
+
       // 最多等 12s：编辑器框架感知输入有延迟，按钮从禁用变可用需要时间
       for (let i = 0; i < 60; i++) {
+        // 水合清空守卫：等待期间活编辑器被重挂清空 → 就地补注后继续找按钮
+        if (isEmpty(live().innerText)) {
+          await reinjectPrompt();
+          continue;
+        }
         const b = findBtn();
         if (b) {
           b.click();
@@ -303,10 +332,11 @@
         await sleep(200);
       }
 
-      // 唯一回退：Enter（contenteditable 内）
-      inputEl.focus();
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      // 唯一回退：Enter（contenteditable 内）——用实时活编辑器派发，inputEl 可能已是重挂后的幽灵节点
+      const enterTarget = live();
+      enterTarget.focus();
+      enterTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      enterTarget.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
       await sleep(2000);
       if (sent()) return 'enter';
 

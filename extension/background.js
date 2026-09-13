@@ -256,13 +256,9 @@ async function handleRequest(msg) {
       let lastCount = 0;
       let stableSince = 0;
 
-      // 首反馈判定基线（ack 成功时由 content 回传）：发送完成瞬间的回答块数与思考态指示器
-      const baseBlocks = (ack && ack.baseBlocks) || 0;
-      const baseFeedback = (ack && ack.baseFeedback) || null;
-      // 生命信号：回复文本出现 / 回答区新增节点 / 思考态或加载指示器（与基线对比）
-      const hasSignal = (st) => (st.count > 0 && !!st.text)
-        || (typeof st.blocks === 'number' && st.blocks > baseBlocks)
-        || (!!st.feedback && st.feedback !== baseFeedback);
+      // 生命信号：回复文本出现 / 思考态或加载指示器（v6 隔离后每次 ask 均从干净首页开始，
+      // 无旧回复，块数基线守卫已剪——qwen 预创建空回答块导致基线永不增长、完成判定失效的教训）
+      const hasSignal = (st) => (st.count > 0 && !!st.text) || !!st.feedback;
 
       const firstSignalMs = (SITES[site] && SITES[site].firstSignalMs) || 12000;
       if (!ack) {
