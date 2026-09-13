@@ -206,37 +206,42 @@
       return out;
     },
 
-    /** 千问输入框是编辑器框架（Lexical/ProseMirror 类），只认 paste/beforeinput 事件 */
+    /**
+     * 千问输入框是 Lexical 编辑器（2026-09-14 复盘：昨天的合成 paste/beforeinput 今天被静默忽略，
+     * 成败押在"编辑器认不认合成事件+选区是否就位"两个不可控条件上，故剪枝重写）：
+     * 主路径 = 显式选区 + execCommand insertText（浏览器内部编辑命令，产生真实 targetRanges，
+     * Lexical 原生支持，不依赖站点对合成事件的兼容）；唯一回退 = paste（选区已显式就位）。
+     * 已删：beforeinput 逐字符循环、textContent 直清 DOM（绕过编辑器内部状态的脏操作）。
+     */
     async setValue(el, text) {
-      el.focus();
       const content = () => (el.innerText || '').replace(/[\u200B\u200C]/g, '').trim();
+      // 显式把选区放进编辑器并折叠到末尾：focus() 不保证 caret 落位，选区才是插入的落点
+      const placeSelection = () => {
+        el.focus();
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      };
 
-      // 策略1：派发 paste 事件（编辑器框架对粘贴的兼容性最好）
+      placeSelection();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+      await sleep(150);
+      document.execCommand('insertText', false, text);
+      await sleep(500);
+      if (content() === text) return 'execCommand';
+
       try {
+        placeSelection();
         const dt = new DataTransfer();
         dt.setData('text/plain', text);
         el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
       } catch {}
       await sleep(600);
       if (content() === text) return 'paste';
-
-      // 策略2：清空后逐字符 beforeinput（React 合成事件体系的标准输入路径）
-      document.execCommand('selectAll', false, null);
-      el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'deleteContentBackward', bubbles: true, cancelable: true }));
-      await sleep(200);
-      if (content()) {
-        // 编辑器不肯删，直接清 DOM 兜底
-        el.textContent = '';
-        el.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
-        await sleep(200);
-      }
-      for (const ch of text) {
-        el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: ch, bubbles: true, cancelable: true }));
-        el.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: ch, bubbles: true }));
-        await sleep(15);
-      }
-      await sleep(400);
-      if (content() === text) return 'beforeinput';
 
       throw new Error(`文本注入失败：编辑器内容为「${content().slice(0, 50)}」`);
     },

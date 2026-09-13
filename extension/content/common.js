@@ -208,7 +208,10 @@
           return;
         }
         if (msg.type === 'probe') {
-          sendResponse({ ok: true, data: ADAPTER.debugMenu ? await ADAPTER.debugMenu() : probe() });
+          // 标准探测为主体，debugMenu 合并附加（不再整体顶掉标准输出）
+          const data = probe();
+          if (ADAPTER.debugMenu) data.debugMenu = await ADAPTER.debugMenu();
+          sendResponse({ ok: true, data });
           return;
         }
         if (msg.type === 'ask') {
