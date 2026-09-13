@@ -22,6 +22,7 @@ const SITES = {
     matches: ['https://www.qianwen.com/*', 'https://qianwen.com/*', 'https://chat.qianwen.com/*'],
     legacyMatches: ['https://www.tongyi.com/*', 'https://tongyi.aliyun.com/*', 'https://chat.aliyun.com/*'],
     cdpInput: true, // 编辑器框架对合成事件免疫，用 chrome.debugger 派发可信输入
+    firstSignalMs: 30000, // 千问出字慢，首反馈窗口放宽到 30s（防真实慢回复被误判无信号）
   },
 };
 
@@ -263,9 +264,10 @@ async function handleRequest(msg) {
         || (typeof st.blocks === 'number' && st.blocks > baseBlocks)
         || (!!st.feedback && st.feedback !== baseFeedback);
 
+      const firstSignalMs = (SITES[site] && SITES[site].firstSignalMs) || 12000;
       if (!ack) {
-        // ack 丢失/超时（页面跳转或消息通道中断）：给 12s 首反馈窗口，无任何生命信号立即报错
-        const ackDeadline = Date.now() + 12000;
+        // ack 丢失/超时（页面跳转或消息通道中断）：给首反馈窗口，无任何生命信号立即报错
+        const ackDeadline = Date.now() + firstSignalMs;
         let st0 = null;
         while (Date.now() < ackDeadline) {
           await sleep(600);
@@ -276,8 +278,8 @@ async function handleRequest(msg) {
           return sendResult(id, stamp({
             ok: false,
             stage: 'no_site_feedback',
-            detail: 'ack 丢失且 12s 内无站点反馈，注入/发送未生效',
-            error: `[${site}][no_site_feedback] ack 丢失且 12s 内无站点反馈，注入/发送未生效`,
+            detail: `ack 丢失且 ${Math.round(firstSignalMs / 1000)}s 内无站点反馈，注入/发送未生效`,
+            error: `[${site}][no_site_feedback] ack 丢失且 ${Math.round(firstSignalMs / 1000)}s 内无站点反馈，注入/发送未生效`,
           }));
         }
         lastText = st0.text || '';
@@ -304,18 +306,18 @@ async function handleRequest(msg) {
         if (!st || !st.ok) continue;
         if (typeof st.blocks === 'number' && st.blocks > baseBlocks) newBlockSeen = true;
 
-        // 首反馈校验（≤12s）：发送成功后回复区必须出现任一生命信号，否则立即报错
+        // 首反馈校验（≤firstSignalMs）：发送成功后回复区必须出现任一生命信号，否则立即报错
         if (!gotSignal) {
           if (hasSignal(st)) {
             gotSignal = true;
           } else {
             noSignalMs += Date.now() - loopStart;
-            if (noSignalMs >= 12000) {
+            if (noSignalMs >= firstSignalMs) {
               return sendResult(id, stamp({
                 ok: false,
                 stage: 'no_site_feedback',
                 detail: `发送后回复区 ${Math.round(noSignalMs / 1000)}s 内无生命信号（无流式文本/思考态/新增节点）`,
-                error: `[${site}][no_site_feedback] 发送后回复区 12s 内无生命信号（无流式文本/思考态/新增节点）`,
+                error: `[${site}][no_site_feedback] 发送后回复区 ${Math.round(firstSignalMs / 1000)}s 内无生命信号（无流式文本/思考态/新增节点）`,
               }));
             }
           }

@@ -214,45 +214,72 @@
      * 已删：beforeinput 逐字符循环、textContent 直清 DOM（绕过编辑器内部状态的脏操作）。
      */
     async setValue(el, text) {
-      const content = () => (el.innerText || '').replace(/[\u200B\u200C]/g, '').trim();
+      // 空编辑器的 innerText 含占位符（「向千问提问」）+ BOM，必须归一化后识别
+      const PLACEHOLDER = '向千问提问';
+      const normalize = (t) => (t || '').replace(/[\u200B\u200C\uFEFF\s]/g, '');
+      const isEmpty = (t) => { const s = normalize(t); return !s || s === PLACEHOLDER; };
+      const liveEl = () => document.querySelector('[contenteditable="true"]') || el;
       // 显式把选区放进编辑器并折叠到末尾：focus() 不保证 caret 落位，选区才是插入的落点
-      const placeSelection = () => {
-        el.focus();
+      const placeSelection = (target) => {
+        target.focus();
         const sel = window.getSelection();
         const range = document.createRange();
-        range.selectNodeContents(el);
+        range.selectNodeContents(target);
         range.collapse(false);
         sel.removeAllRanges();
         sel.addRange(range);
       };
+      const inject = async (target) => {
+        placeSelection(target);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        await sleep(150);
+        document.execCommand('insertText', false, text);
+        await sleep(500);
+        if (normalize(target.innerText) === normalize(text)) return 'execCommand';
+        try {
+          placeSelection(target);
+          const dt = new DataTransfer();
+          dt.setData('text/plain', text);
+          target.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+        } catch {}
+        await sleep(600);
+        if (normalize(target.innerText) === normalize(text)) return 'paste';
+        return null;
+      };
 
-      placeSelection();
-      document.execCommand('selectAll', false, null);
-      document.execCommand('delete', false, null);
-      await sleep(150);
-      document.execCommand('insertText', false, text);
-      await sleep(500);
-      if (content() === text) return 'execCommand';
-
-      try {
-        placeSelection();
-        const dt = new DataTransfer();
-        dt.setData('text/plain', text);
-        el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-      } catch {}
-      await sleep(600);
-      if (content() === text) return 'paste';
-
-      throw new Error(`文本注入失败：编辑器内容为「${content().slice(0, 50)}」`);
+      // 水合自愈：编辑器节点可能被框架异步重挂（注入文本随旧节点死亡）。
+      // 注入后等 300ms 复查活编辑器：节点被换/活编辑器为空 → 对活节点重新注入，最多 3 轮。
+      let target = liveEl();
+      for (let round = 0; round < 3; round++) {
+        const how = await inject(target);
+        await sleep(300);
+        const live = liveEl();
+        if (how && !isEmpty(live.innerText) && normalize(live.innerText) === normalize(text)) {
+          return round ? `${how}+reinject${round}` : how;
+        }
+        if (live !== target) target = live; // 框架重挂，转投活节点
+      }
+      throw new Error(`文本注入失败（含水合重挂自愈 3 轮）：活编辑器内容「${(liveEl().innerText || '').slice(0, 50)}」`);
     },
 
     async send(inputEl) {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      // 实时重查活编辑器：发送成功后 SPA 跳会话页会重挂编辑器，旧引用 innerText 仍有全文（幽灵节点误报）
-      const sent = () => {
-        const live = document.querySelector('[contenteditable="true"]') || inputEl;
-        return !(live.innerText || '').trim(); // 输入框清空 = 已发送
+      // 空编辑器（含占位符）识别
+      const isEmpty = (t) => {
+        const s = (t || '').replace(/[\u200B\u200C\uFEFF\s]/g, '');
+        return !s || s === '向千问提问';
       };
+      const live = () => document.querySelector('[contenteditable="true"]') || inputEl;
+      const startPath = location.pathname;
+      // 发送判定 = URL 离开发送时的页面（qwen 首次发送必跳会话页，硬信号）。
+      // 占位符文本/输入框延迟清空/编辑器重挂全部免疫，比"输入框清空"可靠一个量级。
+      const sent = () => location.pathname !== startPath;
+
+      // 入口守卫：活编辑器必须已有注入文本，防止对空编辑器点幽灵按钮
+      if (isEmpty(live().innerText)) {
+        throw new Error('编辑器重挂，注入丢失（活编辑器为空）——请重试');
+      }
 
       const findBtn = () => {
         for (const b of document.querySelectorAll('button, [role="button"]')) {
@@ -271,41 +298,22 @@
           b.click();
           await sleep(1000);
           if (sent()) return 'click';
-          b.click(); // 再点一次保险
-          await sleep(800);
-          if (sent()) return 'click';
-          break;
+          break; // URL 判定下第二次点击冗余且有重复发送风险，已剪
         }
         await sleep(200);
       }
 
-      // 回退：Enter（contenteditable 内）
+      // 唯一回退：Enter（contenteditable 内）
       inputEl.focus();
       inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
       inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
       await sleep(2000);
       if (sent()) return 'enter';
-      // 再给一次 Enter 机会（框架延迟处理的场景）
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-      await sleep(2000);
-      if (sent()) return 'enter-retry';
 
-      // 诊断快照：按钮状态 + 活编辑器内容 + 当前 URL（发送失败时定位判定问题用）
-      const diag = () => {
-        const live = document.querySelector('[contenteditable="true"]');
-        const all = [...document.querySelectorAll('[contenteditable="true"]')];
-        const b = findBtn();
-        return [
-          `按钮:${b ? '找到可用' : '未找到可用'}`,
-          `编辑器数:${all.length}`,
-          `live#${all.indexOf(live)}内容:「${live ? (live.innerText || '').slice(0, 50) : 'N/A'}」`,
-          `旧引用内容:「${(inputEl.innerText || '').slice(0, 50)}」`,
-          `URL:${location.pathname}`,
-        ].join(' | ');
-      };
-
-      throw new Error(`发送失败：按钮不可用且 Enter 无效 | ${diag()}`);
+      throw new Error(
+        `发送失败：按钮点击与 Enter 均未离开发送页 | 按钮:${findBtn() ? '找到可用' : '未找到可用'}`
+        + ` | 活编辑器:「${(live().innerText || '').slice(0, 30)}」 | URL:${location.pathname}`
+      );
     },
   };
 
