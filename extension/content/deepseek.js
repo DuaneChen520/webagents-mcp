@@ -49,37 +49,29 @@
     },
 
     async send(inputEl) {
-      // 2026-09-14 实测：站点把发送按钮从 <button> 改成 <div>，且单纯 div.click() 不触发其处理
-      // （React onClick 对非受信 click 不响应或监听 pointer 事件）。策略：逐级尝试，每级 600ms
-      // 内看输入框是否清空，未清空则降级下一级。历史实测 Enter 合成事件有效，故必有兜底。
-      const cleared = () => !normalizeText(readInputDefault(inputEl));
+      // 两级发送（剪枝定稿）：click+pointer 为主，Enter 唯一回退；每级 600ms 内以
+      // 「实时重查活输入框已清空」为生效判据（ask 后 SPA 会重挂 textarea，禁止用旧引用判断）
+      const cleared = () => {
+        const live = document.querySelector('textarea, [contenteditable="true"]') || inputEl;
+        return !normalizeText(readInputDefault(live));
+      };
       const btn =
         document.querySelector('#send-message-button') ||
         document.querySelector('.ds-button--primary.ds-button--circle');
       if (btn) {
         btn.click();
-        await sleep(600);
-        if (cleared()) return 'click';
-        // pointer/mouse 完整序列
         for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
           btn.dispatchEvent(t.startsWith('pointer')
             ? new PointerEvent(t, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' })
             : new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
         }
         await sleep(600);
-        if (cleared()) return 'click+pointer';
+        if (cleared()) return 'click';
       }
-      // 回退：聚焦后模拟 Enter
       inputEl.focus();
       inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
       await sleep(600);
-      if (cleared()) return btn ? 'click-failed+enter' : 'enter';
-      // 最后兜底：Enter + keypress 组合
-      inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-      await sleep(600);
-      if (cleared()) return 'enter+kp';
-      return 'none';
+      return cleared() ? (btn ? 'click-failed+enter' : 'enter') : 'none';
     },
   };
 

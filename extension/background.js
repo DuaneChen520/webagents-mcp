@@ -126,9 +126,14 @@ async function ensureTab(site) {
     tab = await chrome.tabs.create({ url: cfg.url, pinned: true, active: false });
     try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (err) { console.log(`[webagents] ${site} 防休眠设置失败: ${err.message}`); }
   } else {
-    // 唤醒休眠标签页 + 防止被 Edge 休眠 + 归位首页（每次 ask 独立全新会话，防上下文污染）
+    // 防止被 Edge 休眠 + 归位首页（每次 ask 独立全新会话）；已在首页则跳过导航避免整页重载
     try {
-      await chrome.tabs.update(tab.id, { url: cfg.url, active: false });
+      const curUrl = String(tab.url || '').split('?')[0].split('#')[0];
+      if (tab.discarded) {
+        try { await chrome.tabs.reload(tab.id); } catch (err3) { console.log(`[webagents] ${site} 唤醒失败: ${err3.message}`); }
+      } else if (curUrl !== cfg.url) {
+        await chrome.tabs.update(tab.id, { url: cfg.url, active: false });
+      }
       try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (err2) { console.log(`[webagents] ${site} 防休眠设置失败: ${err2.message}`); }
     } catch (err) {
       console.log(`[webagents] ${site} 标签页归位失败 tabId=${tab.id}: ${err.message}`);
@@ -195,7 +200,7 @@ async function ensureTab(site) {
 }
 
 // ---- 请求路由 ----
-const SW_VERSION = '6'; // v6: 恢复每次归位首页（独立会话），归位校验改精确 URL 匹配修复竞态；保留基线块数守卫
+const SW_VERSION = '7'; // v7: 完成检测提速(轮询600/稳定400/复确认300)、send 剪枝为两级(click+pointer→Enter)、已在首页跳过导航
 async function handleRequest(msg) {
   const { id, action } = msg;
   const stamp = (r) => Object.assign({ sw: SW_VERSION }, r);
@@ -263,7 +268,7 @@ async function handleRequest(msg) {
         const ackDeadline = Date.now() + 12000;
         let st0 = null;
         while (Date.now() < ackDeadline) {
-          await sleep(1200);
+          await sleep(600);
           try { st0 = await chrome.tabs.sendMessage(tabId, { type: 'state' }); } catch { continue; }
           if (st0 && ((st0.count > 0 && st0.text) || st0.feedback)) break;
         }
@@ -288,7 +293,7 @@ async function handleRequest(msg) {
         if (Date.now() > deadline) {
           return sendResult(id, stamp({ ok: true, text: lastText, timedOut: true }));
         }
-        await sleep(1500);
+        await sleep(600);
 
         let st = null;
         try {
@@ -320,8 +325,8 @@ async function handleRequest(msg) {
         const now = Date.now();
         if (newBlockSeen && count > 0 && text && text === lastText && count === lastCount) {
           if (!stableSince) stableSince = now;
-          if (now - stableSince >= 800) {
-            await sleep(500); // 复确认
+          if (now - stableSince >= 400) {
+            await sleep(300); // 复确认
             let re = null;
             try { re = await chrome.tabs.sendMessage(tabId, { type: 'state' }); } catch {}
             if (re && re.ok && re.text === text) {
