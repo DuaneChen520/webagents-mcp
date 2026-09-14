@@ -1,11 +1,27 @@
 {
   "manifest_version": 3,
   "name": "WebAgents",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "把 DeepSeek / 通义千问等网页版聊天作为 subagent：接收本地 MCP 桥接的请求，注入 prompt 并抓取回复",
-  "permissions": ["tabs", "scripting", "storage", "alarms", "debugger"],
-  "options_ui": { "page": "options.html", "open_in_tab": true },
-  "action": { "default_title": "WebAgents 设置", "default_popup": "popup.html" },
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "alarms",
+    "offscreen"
+  ],
+  "optional_permissions": [
+    "debugger"
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "WebAgents 设置",
+    "default_popup": "popup.html"
+  },
   "host_permissions": [
     "https://chat.deepseek.com/*",
     "https://www.qianwen.com/*",
@@ -15,21 +31,72 @@
     "https://tongyi.aliyun.com/*",
     "https://chat.aliyun.com/*"
   ],
-  "background": { "service_worker": "background.js" },
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
-      "matches": ["https://chat.deepseek.com/*"],
-      "js": ["content/common.js", "content/deepseek.js"],
+      "matches": [
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "content/stream-parse.js",
+        "content/stream-probe.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.qianwen.com/*",
+        "https://qianwen.com/*",
+        "https://chat.qianwen.com/*",
+        "https://www.tongyi.com/*",
+        "https://tongyi.aliyun.com/*",
+        "https://chat.aliyun.com/*"
+      ],
+      "js": [
+        "content/stream-parse.js",
+        "content/stream-probe.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "content/dom-md.js",
+        "content/common.js",
+        "content/deepseek.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.qianwen.com/*", "https://qianwen.com/*", "https://chat.qianwen.com/*"],
-      "js": ["content/common.js", "content/qwen.js"],
+      "matches": [
+        "https://www.qianwen.com/*",
+        "https://qianwen.com/*",
+        "https://chat.qianwen.com/*"
+      ],
+      "js": [
+        "content/dom-md.js",
+        "content/common.js",
+        "content/qwen.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.tongyi.com/*", "https://tongyi.aliyun.com/*", "https://chat.aliyun.com/*"],
-      "js": ["content/common.js", "content/qwen.js"],
+      "matches": [
+        "https://www.tongyi.com/*",
+        "https://tongyi.aliyun.com/*",
+        "https://chat.aliyun.com/*"
+      ],
+      "js": [
+        "content/dom-md.js",
+        "content/common.js",
+        "content/qwen.js"
+      ],
       "run_at": "document_idle"
     }
   ]

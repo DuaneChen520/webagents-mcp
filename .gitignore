@@ -1,2 +1,21 @@
+# 依赖与构建产物
 node_modules/
+
+# 本地运行数据（令牌文件、运行记录 —— 在 %LOCALAPPDATA%/webagents，防御性排除）
 *.log
+runs*.jsonl
+bridge.json
+
+# 工作文档（内部调研/计划，不公开）
+research-*.md
+PLAN-optimization.md
+
+# 工作区数据
+.workbuddy/
+
+# 本地环境与系统文件
+.env
+*.local
+._*
+Thumbs.db
+desktop.ini

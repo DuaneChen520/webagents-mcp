@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>WebAgents 常驻连接</title>
+</head>
+<body>
+  <!--
+    这个页面永远不会显示给用户，存在的唯一目的是"持有 WebSocket"。
+
+    为什么不能放在 Service Worker 里：MV3 的 SW 空闲 30s 就被回收，
+    回收时它持有的连接会断（浏览器关闭/扩展卸载之外，这是最常见的中断原因）。
+    offscreen document 的生命周期与 SW 独立，除音频播放外不设时长上限，
+    因此连接可以一直保持，SW 该睡就睡、该醒就醒。
+  -->
+  <script src="offscreen.js"></script>
+</body>
+</html>

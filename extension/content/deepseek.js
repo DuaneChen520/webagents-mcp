@@ -55,9 +55,11 @@
         const live = document.querySelector('textarea, [contenteditable="true"]') || inputEl;
         return !normalizeText(readInputDefault(live));
       };
-      const btn =
-        document.querySelector('#send-message-button') ||
-        document.querySelector('.ds-button--primary.ds-button--circle');
+      // 2026-09-15 取证：旧的主选择器 #send-message-button 已从线上产物中移除
+      // （CSS/JS 均 0 命中），实际一直靠下面的回退选择器在工作，故删掉死选择器。
+      // 另注：发送与"停止生成"是同一个 DOM 元素，只是生成期间行为不同 —— 因此
+      // 不能靠"按钮消失"判断答完，完成判定走流探针（见 content/stream-probe.js）。
+      const btn = document.querySelector('.ds-button--primary.ds-button--circle');
       if (btn) {
         btn.click();
         for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {

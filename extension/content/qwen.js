@@ -22,6 +22,15 @@
     // 思考模式出现「思考中」指示/思考内容块；另有 common.js 跨站兜底（loading/停止按钮等）
     thinkingSel: ['[class*="think" i]'],
 
+    // DOM 级完成标记（2026-09-15 实抓确认）：回答根节点是 qk-markdown 系列，
+    // 生成期间类名 = "qk-markdown qk-markdown-react qk-markdown-code-dark"（无 complete），
+    // 完成后追加 "qk-markdown-complete"。这是千问版的"服务端已关闭响应流"——
+    // 协议里的 event:complete / sse_end:"1" 因作答流不可达而用不上，就用这个。
+    completeMarker: {
+      sel: '[class*="qk-markdown"]',
+      done: /qk-markdown-complete/i,
+    },
+
     /**
      * 对话模式切换（2026-09-13 二次 probe 实测 DOM）：
      * - 当前模式显示在 radix 下拉触发按钮上（button#radix-…，text=快速/思考/研究）
@@ -273,12 +282,28 @@
       };
       const live = () => document.querySelector('[contenteditable="true"]') || inputEl;
       const startPath = location.pathname;
-      // 发送判定 = URL 离开发送时的页面（qwen 首次发送必跳会话页，硬信号）。
-      // 占位符文本/输入框延迟清空/编辑器重挂全部免疫，比"输入框清空"可靠一个量级。
-      const sent = () => location.pathname !== startPath;
+      // 记录发送时刻的判定基线，供 verifySent 复用同一套标准。
+      // 为什么必须记：跳转到新会话后页面会水合重挂，编辑器可能暂时为空/不存在，
+      // common.js 的默认校验（"第一个 contenteditable 是否清空"）在这种过渡期会误判未发送。
+      ADAPTER.__sendBase = { startPath, at: Date.now() };
+      // —— 三选一发送判定（2026-09-14 P3a）——
+      // ① URL 跳转：新会话首发必跳 /chat/<id>，硬信号；
+      // ② user 气泡出现：页面正文出现本次 prompt 开头文本（气泡信号与编辑器自身文本同源，
+      //    仅在编辑器清空后才可信，故 ② 定义为「清空 ∧ 正文含 prompt 开头」）；
+      // ③ 起始 URL 已是 /chat/<id>（补发/重试/归位失败场景）时 ① 不触发，由 ② 判定。
+      // 编辑器清空不单独计成功——水合重挂同样会清空，单独采纳会把「注入丢失」误判为「已发送」。
+      const norm = (t) => (t || '').replace(/[\u200B\u200C\u200D\uFEFF\s]/g, '');
+      const head = norm(ADAPTER.__lastText || '').slice(0, 30);
+      const userBubbleShown = () => {
+        if (!head) return false;
+        try { return norm(document.body.innerText).includes(head); } catch { return false; }
+      };
+      const sent = () => location.pathname !== startPath || (isEmpty(live().innerText) && userBubbleShown());
 
-      // 入口守卫：活编辑器为空时先就地补注（水合重挂可能吃掉注入文本），补注失败才报错
+      // 入口守卫（P3a 补注前置检查）：活编辑器为空且本次 prompt 的 user 气泡已在会话中
+      // = 上一轮实际已发出，跳过补注直接返回，防止二次注入 → 二次发送
       if (isEmpty(live().innerText)) {
+        if (userBubbleShown()) return 'bubble-already-sent';
         const reinject = await reinjectPrompt();
         if (!reinject) {
           throw new Error('编辑器重挂，注入丢失且补注失败（活编辑器为空）——请重试');
@@ -315,19 +340,24 @@
         return !isEmpty(live().innerText);
       }
 
+      let fired = false; // 已触发发送动作；此后编辑器清空只等信号，绝不补注/重发（防二次发送）
       // 最多等 12s：编辑器框架感知输入有延迟，按钮从禁用变可用需要时间
       for (let i = 0; i < 60; i++) {
-        // 水合清空守卫：等待期间活编辑器被重挂清空 → 就地补注后继续找按钮
+        if (sent()) return 'signal';
         if (isEmpty(live().innerText)) {
+          if (userBubbleShown()) return 'bubble-already-sent'; // 气泡已在：跳过补注防二次注入
+          if (fired) { await sleep(200); continue; } // 触发后清空 = 发送在途，等 ①/② 信号
           await reinjectPrompt();
           continue;
         }
         const b = findBtn();
         if (b) {
           b.click();
-          await sleep(1000);
+          fired = true;
+          // 触发后最多再等 6s 确认信号（SPA 跳转/气泡渲染有延迟）
+          for (let w = 0; w < 12 && !sent(); w++) await sleep(500);
           if (sent()) return 'click';
-          break; // URL 判定下第二次点击冗余且有重复发送风险，已剪
+          break; // 仍无信号 → Enter 回退
         }
         await sleep(200);
       }
@@ -341,9 +371,31 @@
       if (sent()) return 'enter';
 
       throw new Error(
-        `发送失败：按钮点击与 Enter 均未离开发送页 | 按钮:${findBtn() ? '找到可用' : '未找到可用'}`
+        `发送失败：按钮点击与 Enter 均未出现发送信号(URL跳转/气泡) | 按钮:${findBtn() ? '找到可用' : '未找到可用'}`
         + ` | 活编辑器:「${(live().innerText || '').slice(0, 30)}」 | URL:${location.pathname}`
       );
+    },
+
+    /**
+     * 发送校验：**与 send() 的三选一判定同源**，不能用通用默认。
+     *
+     * 实测踩过：通用默认看"第一个 contenteditable 是否清空"，而千问跳转到新会话后
+     * 页面会水合重挂（编辑器短暂为空甚至不存在），8 秒窗口内被判"未发送" →
+     * 实际已提交的问答被当作失败（URL 都已经变成 /chat/<新id> 了）。
+     */
+    verifySent(input, prompt) {
+      const base = ADAPTER.__sendBase || { startPath: location.pathname };
+      // ① URL 跳转（与 send() 同一硬信号）
+      if (location.pathname !== base.startPath) return true;
+      // ② 编辑器已清空 ∧ 正文含本次 prompt 开头（user 气泡）
+      const ed = document.querySelector('[contenteditable="true"]') || input;
+      const txt = (ed && ed.innerText) || '';
+      const normT = (t) => (t || '').replace(/[\u200B\u200C\u200D\uFEFF\s]/g, '');
+      const isEmptyNow = !normT(txt).length;
+      const head = normT(prompt).slice(0, 30);
+      let bubble = false;
+      if (head) { try { bubble = normT(document.body.innerText).includes(head); } catch { /* 忽略 */ } }
+      return isEmptyNow && bubble;
     },
   };
 

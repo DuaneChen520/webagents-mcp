@@ -12,6 +12,111 @@
 (() => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // =====================================================================
+  // 主世界流探针桥接（2026-09-15）
+  //
+  // 背景：站点的"回复结束"是明确的（DeepSeek 有 MessageStatus 枚举 + 终态定义
+  // `status !== 'WIP'`），但该状态只在网络响应流里，不写 DOM、不进控制台。
+  // 主世界探针 content/stream-probe.js 负责拦流，这里负责接收与上报。
+  //
+  // 注意：隔离世界读不到主世界的全局变量，探针只能"自报身份"（world 字段）。
+  // 若自报 isolated，说明 manifest 的 world:"MAIN" 未生效，上层必须放弃流信号。
+  // =====================================================================
+  const PROBE_SRC = 'webagents-probe';
+  // 探针的"回复"走独立来源标记（它自己的监听器会忽略该来源，避免自问自答递归）
+  const PROBE_REPLY_SRC = 'webagents-probe-reply';
+  const pendingQueries = new Map();
+  const pendingTexts = new Map();
+  let probeInfo = { alive: false, world: null };   // 探针可达性与所处世界
+  let lastStream = null;                            // 最近一次流记录（缓存，快速路径）
+  let lastStreamsList = [];                         // 本页全部流的摘要（诊断用）
+  /**
+   * 已结束流的正文本地缓存（id → text）。
+   * 探针在 stream-end 事件里就把正文带出来了，这里直接存下 ——
+   * 上层取正文时无需再跨世界往返（那一跳曾经丢过，见 streamText 处理）。
+   */
+  const endedStreams = new Map();
+
+  window.addEventListener('message', (ev) => {
+    const d = ev && ev.data;
+    if (!d) return;
+    // 通知类走 PROBE_SRC，回复类走 PROBE_REPLY_SRC，两者都要接收
+    if (d.source !== PROBE_SRC && d.source !== PROBE_REPLY_SRC) return;
+    switch (d.type) {
+      case 'stream-start':
+        lastStream = { id: d.id, url: d.url, startedAt: d.startedAt, endedAt: 0, status: null };
+        break;
+      case 'stream-tick':
+        if (lastStream && lastStream.id === d.id && d.status) lastStream.status = d.status;
+        break;
+      case 'stream-end':
+        lastStream = {
+          id: d.id, url: lastStream && lastStream.url, startedAt: d.startedAt, endedAt: d.endedAt,
+          status: d.status || null, opCount: d.opCount, markdownLength: d.markdownLength, reason: d.reason,
+        };
+        // 正文随事件带出，本地留档（最多 4 条，够本次问答与上一次回退）
+        if (typeof d.text === 'string') {
+          endedStreams.set(d.id, d.text);
+          while (endedStreams.size > 4) endedStreams.delete(endedStreams.keys().next().value);
+        }
+        break;
+      case 'stream-detail': {
+        probeInfo = { alive: !!d.probeAlive, world: d.world || null };
+        // 本页全部流的摘要：一次问答可能有多条流（风控预审 + 正式作答），
+        // 只看"最新一条"会误判成"没有作答流"（2026-09-15 千问取证踩过）。
+        if (Array.isArray(d.streams)) lastStreamsList = d.streams;
+        const resolve = pendingQueries.get(d.id);
+        if (resolve) { pendingQueries.delete(d.id); resolve(d.data || null); }
+        if (d.data) lastStream = d.data;
+        break;
+      }
+      case 'stream-text': {
+        const resolve = pendingTexts.get(d.id);
+        if (resolve) { pendingTexts.delete(d.id); resolve(d.text || ''); }
+        break;
+      }
+      default:
+        break;
+    }
+  });
+
+  /**
+   * 向主世界探针要一次当前流记录。
+   * since：只接受该时间戳之后开始的流 —— 每次 ask 前由调用方给定，
+   * 避免把上一次问答遗留的流误当成本次的完成信号。
+   * 超时即视为探针不可用，上层自动退回 DOM 判定。
+   */
+  function queryStream(since, timeoutMs = 200) {
+    const id = `q${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { pendingQueries.delete(id); resolve(null); }, timeoutMs);
+      pendingQueries.set(id, (data) => { clearTimeout(timer); resolve(data); });
+      try {
+        window.postMessage({ source: PROBE_SRC, type: 'stream-query', id, since: since || 0 }, '*');
+      } catch {
+        clearTimeout(timer);
+        pendingQueries.delete(id);
+        resolve(null);
+      }
+    });
+  }
+
+  /** 取探针还原出的原始 markdown 正文（只在需要时调用一次，避免轮询期反复搬运大字符串） */
+  function queryStreamText(since, timeoutMs = 1200, streamId = null) {
+    const id = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { pendingTexts.delete(id); resolve(''); }, timeoutMs);
+      pendingTexts.set(id, (text) => { clearTimeout(timer); resolve(text || ''); });
+      try {
+        window.postMessage({ source: PROBE_SRC, type: 'stream-text', id, since: since || 0, streamId }, '*');
+      } catch {
+        clearTimeout(timer);
+        pendingTexts.delete(id);
+        resolve('');
+      }
+    });
+  }
+
   /** React 受控 textarea 需要 native setter 才能让框架感知 value 变化 */
   function setNativeValue(el, value) {
     const proto = el instanceof HTMLTextAreaElement
@@ -43,11 +148,20 @@
       const blocks = document.querySelectorAll(sel);
       if (blocks.length) {
         const last = blocks[blocks.length - 1];
-        const text = (last.innerText || '').trim();
-        if (text) return { count: blocks.length, text, sel };
+        // 优先用 DOM→markdown 序列化器拿**结构化正文**（表格还原成管道表、代码块还原成围栏），
+        // innerText 只作兜底 —— 它会把工具栏文字混进来、把表格和代码的结构丢掉。
+        const DM = window.__WEBAGENTS_DOMMD__;
+        let text = '';
+        let viaMd = false;
+        if (DM && typeof DM.toMarkdown === 'function') {
+          try { text = String(DM.toMarkdown(last, { maxLen: 200000 }) || '').trim(); } catch { text = ''; }
+          if (text) viaMd = true;
+        }
+        if (!text) text = (last.innerText || '').trim();
+        if (text) return { count: blocks.length, text, sel, viaMd };
       }
     }
-    return { count: 0, text: '', sel: null };
+    return { count: 0, text: '', sel: null, viaMd: false };
   }
   async function waitFor(selector, timeoutMs = 30000) {
     const deadline = Date.now() + timeoutMs;
@@ -62,6 +176,16 @@
   /** 归一化：去零宽字符与首尾空白（注入读回比对用） */
   function normalizeText(s) {
     return String(s || '').replace(/[\u200B\u200C\u200D\uFEFF]/g, '').trim();
+  }
+
+  /**
+   * 空白不敏感比较形（2026-09-14 P3a 修复）：在 normalizeText 基础上再剥除全部空白。
+   * 根因：读回与预期肉眼一致仍判不等——Lexical/ProseMirror 类编辑器回显时会调整
+   * 内部空白（换行↔段落间距、连续空格折叠），逐字严格相等把等价内容误判为注入失败。
+   * 注入校验只关心「文本进了编辑器」，空白形态差异不算差异。
+   */
+  function squashText(s) {
+    return normalizeText(s).replace(/\s+/g, '');
   }
 
   /** 读回编辑器当前内容：textarea/input 读 value，contenteditable 读 innerText */
@@ -109,6 +233,66 @@
     return 0;
   }
 
+  /**
+   * 风控挑战（滑块/验证）检测 —— 见方案 A。
+   *
+   * 为什么必须做：站点标签页是**后台标签**（`active:false`），挑战弹在用户完全看不见的地方。
+   * 于是现象不是"请你划一下"，而是"任务无声卡死到超时"。检测到之后由 SW 把标签页切到前台，
+   * 用户验证完任务自动继续。
+   *
+   * 判定策略：**只认"看起来确实是挑战组件"**（可见 + 尺寸合理），
+   * 单独加载风控 SDK 不算 —— SDK 每次页面加载都在（千问是阿里霸下，域 sec.qianwen.com），
+   * 把它当挑战会误伤每一次正常问答。误判的代价是打断正常任务，所以宁可漏报。
+   */
+  const RISK_SDK_HOST = /(^|\.)(sec|pre-sec)\.(qianwen|qwen)\.com$/i;
+  const CHALLENGE_SEL = [
+    '[id*="nc_" i]', '[class*="nc_" i]', '[id*="nocaptcha" i]', '[class*="nocaptcha" i]',
+    '[id*="captcha" i]', '[class*="captcha" i]', '[id*="baxia" i]',
+    '[class*="slide-verify" i]', '[class*="slider-verify" i]', '[class*="verify-wrap" i]',
+    '[class*="verifyWrap"]', '[class*="drag-verify" i]',
+  ].join(',');
+
+  function challengeVisible(el) {
+    try {
+      if (!el || !el.getBoundingClientRect) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 120 || r.height < 24) return false;      // 挑战条不会这么小
+      const st = window.getComputedStyle(el);
+      return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) > 0.05;
+    } catch { return false; }
+  }
+
+  let challengeCache = { at: 0, value: null };
+
+  function detectChallenge() {
+    const now = Date.now();
+    // 节流 1.5s：state 每 600ms 轮询一次，不必每次都全量扫 DOM
+    if (now - challengeCache.at < 1500) return challengeCache.value;
+
+    let sdk = false;
+    let ui = 0;
+    let sel = '';
+    try {
+      for (const el of document.querySelectorAll('script[src], iframe[src], link[href]')) {
+        const u = el.src || el.href || '';
+        if (!u) continue;
+        try {
+          if (RISK_SDK_HOST.test(new URL(u, location.href).host)) { sdk = true; break; }
+        } catch { /* 相对/非法 URL 忽略 */ }
+      }
+    } catch { /* 忽略 */ }
+    try {
+      for (const el of document.querySelectorAll(CHALLENGE_SEL)) {
+        if (challengeVisible(el)) { ui++; if (!sel) sel = el.className ? `.${String(el.className).split(/\s+/)[0]}` : el.tagName.toLowerCase(); }
+      }
+    } catch { /* 选择器非法忽略 */ }
+
+    // 只有"可见的挑战 UI"才算 present；SDK 已加载仅作为上下文如实上报
+    const value = (ui > 0 || sdk) ? { present: ui > 0, ui, sdk, sel: sel || null } : null;
+    challengeCache = { at: now, value };
+    return value;
+  }
+
   /** 思考态/生成中指示器：适配器 thinkingSel 优先，另附跨站宽松兜底 */
   const FEEDBACK_FALLBACK_SEL = [
     '[class*="thinking" i]', '[class*="loading" i]', '[class*="spinner" i]',
@@ -123,6 +307,22 @@
       }
     }
     return null;
+  }
+
+  /**
+   * DOM 级完成标记（站点可选配置 ADAPTER.completeMarker = { sel, done }）。
+   * 取标记元素的**最后一个**（多轮对话时最新一条回答才算数）：
+   *   true  = done 正则命中（已完成）
+   *   false = 标记元素存在但未命中（仍在生成）
+   *   null  = 站点未配置 / 页面上找不到标记元素（此时上层按"无标记"处理，不参与判定）
+   */
+  function completionState(ADAPTER) {
+    const cm = ADAPTER && ADAPTER.completeMarker;
+    if (!cm || !cm.sel || !cm.done) return null;
+    let els = [];
+    try { els = document.querySelectorAll(cm.sel); } catch { return null; }
+    if (!els.length) return null;
+    return cm.done.test(String(els[els.length - 1].className || '')) ? true : false;
   }
 
   /** DOM 探测：站点改版时用于修正选择器 */
@@ -141,6 +341,18 @@
       const text = (el.innerText || '').trim();
       if (text) out.markdownish.push({ tag: el.tagName, cls: String(el.className).slice(0, 140), text: text.slice(0, 100), visible: !!el.offsetParent });
     });
+    // 回答块 HTML 头尾：结构问题（行号/工具栏/卡片标题混入正文）一次看穿。仅诊断用。
+    // 头部看根节点类名（完成标记），尾部看代码块结构（表格卡片在前、代码在后，SVG 很占字符）。
+    try {
+      const mdEls = document.querySelectorAll('[class*="markdown" i], [class*="answer" i]');
+      const lastMd = mdEls[mdEls.length - 1];
+      if (lastMd) {
+        const html = String(lastMd.outerHTML || '');
+        out.answerHtml = html.length <= 3400
+          ? html
+          : html.slice(0, 600) + '\n...[snip]...\n' + html.slice(-2800);
+      }
+    } catch { /* 忽略 */ }
     document.querySelectorAll('button, [role="button"]').forEach((el) => {
       const cls = String(el.className);
       const label = el.getAttribute('aria-label') || el.getAttribute('title') || '';
@@ -211,6 +423,14 @@
           // 标准探测为主体，debugMenu 合并附加（不再整体顶掉标准输出）
           const data = probe();
           if (ADAPTER.debugMenu) data.debugMenu = await ADAPTER.debugMenu();
+          // 流探针诊断：确认探针是否在主世界、能否看到流、字段长什么样
+          data.stream = {
+            probeAlive: probeInfo.alive,
+            probeWorld: probeInfo.world,
+            last: await queryStream(msg.since || 0, 800),
+          };
+          // 顺带带上风控挑战检测：现场取证时最关心的就是"是不是被验证拦住了"
+          data.challenge = detectChallenge();
           sendResponse({ ok: true, data });
           return;
         }
@@ -262,11 +482,96 @@
         }
         if (msg.type === 'state') {
           const st = answerState(ADAPTER);
+          // 流状态：优先取缓存（快路径），否则主动问一次探针。
+          // 200ms 上限远小于 SW 600ms 轮询周期，不会拖慢判定节奏。
+          let stream = lastStream;
+          if (!stream || stream.startedAt < (msg.since || 0)) {
+            stream = await queryStream(msg.since || 0, 200) || stream;
+          }
           sendResponse({
             ok: true, url: location.href, count: st.count, text: st.text, sel: st.sel,
+            viaMd: !!st.viaMd,   // 正文来自 DOM→markdown 序列化（而非 innerText）
             blocks: blockCount(ADAPTER),
             feedback: siteFeedback(ADAPTER),
+            // DOM 级完成标记（如千问的 qk-markdown-complete）：
+            //   true=已完成 / false=标记元素在但未完成（仍在生成）/ null=站点无标记或不适用
+            complete: completionState(ADAPTER),
+            // 风控挑战（滑块等）检测结果：present=true 时上层会把标签页切到前台并等待人工完成
+            challenge: detectChallenge(),
             options: ADAPTER.optionState ? ADAPTER.optionState() : null,
+            // 探针健康度：即使当前没有流记录，也能知道探针是否可用
+            streamProbe: { alive: probeInfo.alive, world: probeInfo.world },
+            // stream: null=探针不可用（上层退回 DOM 判定）
+            //    endedAt>0 = 服务端已关闭响应流（协议级硬信号）
+            //    status    = 站点自报终态（FINISHED / INCOMPLETE / TIMEOUT / ...）
+            // 正文不在此处下发（每次轮询都传 200KB 太浪费），需要时用 streamText 单独取
+            stream: stream ? {
+              id: stream.id,
+              probeWorld: probeInfo.world,
+              startedAt: stream.startedAt,
+              endedAt: stream.endedAt || 0,
+              status: stream.status || null,
+              opCount: stream.opCount || 0,
+              url: stream.url || '',
+              markdownLength: stream.markdownLength || 0,
+            } : null,
+          });
+          return;
+        }
+
+        if (msg.type === 'streamText') {
+          // 取探针还原出的原始 markdown（仅在流已结束后由上层按需调用一次）
+          // 路径一：本地缓存（探针在 stream-end 时已把正文带出）—— 不跨世界往返，最可靠
+          if (msg.streamId && endedStreams.has(msg.streamId)) {
+            sendResponse({
+              ok: true, via: 'cache',
+              text: endedStreams.get(msg.streamId) || '',
+              probeWorld: probeInfo.world,
+            });
+            return;
+          }
+          // 路径二：回退到向探针查询（streamId 指定具体哪条流，避免只按"最新"取而张冠李戴）
+          const text = await queryStreamText(msg.since || 0, msg.timeoutMs || 1200, msg.streamId || null);
+          sendResponse({ ok: true, via: 'probe', text: text || '', probeWorld: probeInfo.world });
+          return;
+        }
+
+        if (msg.type === 'streamDiag') {
+          // 诊断：仅在"流信号不可用/正文还原失败"时由上层调用。
+          // 必须当次采集 —— 问答结束后标签页会被导回首页（整页重载），
+          // 探针记录随之清空，事后无法再查。
+          const data = await queryStream(msg.since || 0, msg.timeoutMs || 1200);
+          const st = answerState(ADAPTER);
+          let bodyHead = '';
+          try { bodyHead = (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 300); } catch { /* 忽略 */ }
+          sendResponse({
+            ok: true,
+            probeWorld: probeInfo.world,
+            probeAlive: probeInfo.alive,
+            data: data ? {
+              url: data.url, contentType: data.contentType, status: data.status,
+              opCount: data.opCount, markdownLength: data.markdownLength,
+              rootKeys: data.rootKeys, responseKeys: data.responseKeys,
+              events: data.events,
+              // 帧形态统计 + 裸字符串样本：定位"为什么没还原出正文"的关键证据。
+              // 样本给到 1200 字符 —— 300 字符只够看到遥测头部，看不出正文形态（踩过）。
+              frames: data.frames,
+              rawTexts: data.rawTexts,
+              sampleHead: String(data.sample || '').slice(0, 1200),
+            } : null,
+            // 本页全部流的摘要：判断"作答流到底有没有被抓到"的决定性证据
+            streams: lastStreamsList,
+            // 完成标记与生成指示器当次状态：判断"门控是否生效"的直接证据
+            complete: completionState(ADAPTER),
+            feedback: siteFeedback(ADAPTER),
+            dom: {
+              url: location.href,
+              count: st.count, sel: st.sel,
+              textLen: (st.text || '').length,
+              textHead: (st.text || '').slice(0, 200),
+              blocks: blockCount(ADAPTER),
+              bodyHead,
+            },
           });
           return;
         }
@@ -275,5 +580,5 @@
     });
   }
 
-  window.__WEBAGENTS__ = { wire, sleep, waitFor, setNativeValue, setInputValue, probe, answerState, normalizeText, readInputDefault };
+  window.__WEBAGENTS__ = { wire, sleep, waitFor, setNativeValue, setInputValue, probe, answerState, normalizeText, squashText, readInputDefault, queryStream, queryStreamText };
 })();

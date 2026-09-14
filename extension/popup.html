@@ -23,11 +23,16 @@
     #save:hover { filter: brightness(1.08); }
     #status { color: #17a561; font-size: 12px; font-weight: 600; opacity: 0; transition: opacity .25s; }
     #status.show { opacity: 1; }
+    .perm-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .plain { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 6px 14px; font-size: 12px; color: var(--text); cursor: pointer; font-family: inherit; transition: all .15s; }
+    .plain:hover { border-color: var(--accent); color: var(--accent); }
+    .state { font-size: 11px; color: var(--sub); }
+    .state.ok { color: #17a561; font-weight: 600; }
   </style>
 </head>
 <body>
   <header><span class="logo">W</span><h1>WebAgents 对话开关</h1></header>
-  <p class="hint">强制开关，优先级最高（覆盖调用方参数）；「默认」= 不干预页面当前状态。</p>
+  <p class="hint">强制开关，优先级最高（覆盖调用方参数）；「默认」= 不干预页面当前状态。同一站点同一时刻只处理一个任务，多任务会自动排队。</p>
 
   <div class="card">
     <div class="card-title">DEEPSEEK</div>
@@ -51,6 +56,28 @@
       <div class="row-label">对话模式</div>
       <div class="seg" id="qwenMode">
         <button data-value="">默认</button><button data-value="fast">快速</button><button data-value="think">思考研究</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">调用节流</div>
+    <div class="row">
+      <div class="row-label">同站点两次提问的最小间隔</div>
+      <div class="seg" id="throttleSec">
+        <button data-value="0">关闭</button><button data-value="3">3 秒</button><button data-value="8">8 秒</button><button data-value="20">20 秒</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">备用输入通道（按需授权）</div>
+    <div class="row">
+      <div class="row-label">可信输入（chrome.debugger）—— 当前无调用方，仅备用</div>
+      <div class="perm-row">
+        <button id="grantDebug" class="plain">授予</button>
+        <button id="revokeDebug" class="plain">撤销</button>
+        <span id="debugState" class="state">检测中…</span>
       </div>
     </div>
   </div>
