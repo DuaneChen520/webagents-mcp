@@ -533,7 +533,82 @@ async function ensureTab(site) {
 }
 
 // ---- 请求路由 ----
-const SW_VERSION = '9'; // v9: 连接改由 offscreen 文档承载（不再需要保活）+ 令牌配对 + 首反馈两档 + 站点级串行队列 + 调用节流 + 掉线快速失败
+const SW_VERSION = '10'; // v10: 新增 continue（同会话追问）—— ensureContinueTab 不导航现场校验 + 发送前基线判定（v9: offscreen 承载连接 + 令牌配对 + 首反馈两档 + 站点级串行队列 + 调用节流 + 掉线快速失败）
+
+/**
+ * continue 模式的标签页校验：**绝不导航、绝不创建、绝不刷新**。
+ * 与 ensureTab 的本质区别：ensureTab 会归位首页并清掉残留回复（= 每次全新会话），
+ * 而这里恰恰要保住会话现场。验收条件 = 适配器就绪 + 不在首页（在某个会话页里）+ 有历史回复。
+ * 任何一条不满足都明确报 session_gone，由调用方决定是否去掉 --continue 发首问。
+ */
+async function ensureContinueTab(site) {
+  const cfg = SITES[site];
+  const deadline = Date.now() + 30000;
+  let injected = false;
+  let lastErr = '';
+  let snap = [];                 // 最后一轮的逐标签现场快照：失败时随错误带出（诊断铁律：失败必须可归因）
+  const activated = new Set();   // 冻结标签的激活解冻只做一次，避免反复抢焦点
+  let round = 0;
+  while (Date.now() < deadline) {
+    let tabs = await chrome.tabs.query({ url: cfg.matches });
+    if (!tabs.length && cfg.legacyMatches) tabs = await chrome.tabs.query({ url: cfg.legacyMatches });
+    if (!tabs.length) {
+      throw new Error('该站点没有已打开的标签页，无可续接的会话（先发一次不带 --continue 的首问）');
+    }
+    // 逐个候选尝试（tabs[0] 可能不是当前会话页，也可能处于 Edge 冻结态 —— 2026-09-15 实测）
+    snap = [];
+    for (const tab of tabs) {
+      try {
+        const info = { id: tab.id, discarded: !!tab.discarded, url: String(tab.url || '').slice(0, 50) };
+        snap.push(info);
+        if (tab.discarded) {
+          try { await chrome.tabs.reload(tab.id); } catch (err) { lastErr = `唤醒失败: ${err.message}`; }
+          continue; // 已丢弃的标签刷新后下一轮再验
+        }
+        let r = null;
+        let cur = null;
+        let st = null;
+        try { r = await chrome.tabs.sendMessage(tab.id, { type: 'ping' }); } catch (err) { lastErr = err.message; info.pingErr = String(err.message).slice(0, 60); }
+        try { cur = await chrome.tabs.get(tab.id); } catch { /* 忽略 */ }
+        try { st = await chrome.tabs.sendMessage(tab.id, { type: 'state' }); } catch (err2) { info.stateErr = String(err2.message).slice(0, 60); }
+        const path = String((cur && cur.url) || '').split('?')[0].split('#')[0];
+        const onChatPage = !!cur && path !== cfg.url;   // 不在首页 = 在某个会话页里
+        const hasReplies = !!(st && st.ok && st.count > 0);
+        info.ready = !!(r && r.ready);
+        info.stateOk = !!(st && st.ok);
+        info.count = (st && st.count) || 0;
+        info.onChatPage = onChatPage;
+        info.hasReplies = hasReplies;
+        if (r && r.ready && onChatPage && hasReplies) return tab.id;
+        // ping 无响应但标签没被丢弃 → 多半是 Edge 冻结了后台标签（content script 冻结）。
+        // 激活一次即可解冻，**不刷新**（刷新会摧毁会话现场）；每个标签只激活一次。
+        if (!r && !activated.has(tab.id)) {
+          activated.add(tab.id);
+          console.log(`[webagents] ${site} 标签页 ${tab.id} ping 无响应，尝试激活解冻（不刷新）`);
+          try { await chrome.tabs.update(tab.id, { active: true }); } catch (err) { lastErr = err.message; }
+        }
+      } catch (err) { lastErr = err.message; }
+    }
+    // 补注入与 ensureTab 同策略：第 0 轮与第 15 轮各试一次
+    if (!injected && (round === 0 || round === 15)) {
+      injected = true;
+      for (const tab of tabs) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['content/common.js', `content/${site}.js`],
+          });
+        } catch (err) { lastErr = `补注入失败: ${err.message}`; }
+      }
+    }
+    injected = true;
+    round++;
+    await sleep(1000);
+  }
+  throw new Error(
+    `continue 现场校验失败（30s）：候选标签均不满足"会话页+有历史回复" | 现场=${JSON.stringify(snap).slice(0, 400)} | ${lastErr || 'ping 无响应'}`
+  );
+}
 
 /** 请求入口：先过站点级串行队列，再分发 */
 async function handleRequest(msg) {
@@ -633,7 +708,23 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
       }));
     }
 
-    const tabId = await ensureTab(site);
+    // continue（同会话追问）与全新会话走不同的标签页校验：
+    // continue 绝不导航（保住会话现场），校验失败明确报 session_gone
+    const cont = !!msg.continue;
+    let tabId;
+    if (cont) {
+      try {
+        tabId = await ensureContinueTab(site);
+      } catch (err) {
+        return sendResult(id, stamp({
+          ok: false, stage: 'session_gone',
+          detail: err.message,
+          error: `[${site}][session_gone] ${err.message}`,
+        }));
+      }
+    } else {
+      tabId = await ensureTab(site);
+    }
 
     if (action === 'probe') {
       const r = await chrome.tabs.sendMessage(tabId, { type: 'probe' });
@@ -683,6 +774,18 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
       // askSince：本次问答起点。流记录必须"开始于此刻之后"，否则是上一次问答的遗留。
       const askSince = Date.now();
 
+      // continue 基线：发送前把"旧回复"的块数与末块文本记下来。
+      // 会话页上留着历史回复，若不设基线，旧回复会被当成生命信号/稳定正文 ——
+      // 最坏表现：刚发出追问 1 秒就把上一轮的答案原样返回（比失败更具迷惑性）。
+      let base = null;
+      if (cont) {
+        try {
+          const b = await chrome.tabs.sendMessage(tabId, { type: 'state', since: askSince });
+          if (b && b.ok) base = { count: b.count || 0, text: b.text || '' };
+        } catch { /* 基线拿不到时按宽松模式（见 hasSignal） */ }
+        stampBase.continued = true;
+      }
+
       // ack 兜底 60s：content 最坏合法路径（长文本逐字符注入×2 次 + 选项切换）可能 ~50s，
       // 超时按 ack 丢失处理，绝不无限挂起等 sendMessage。
       const ack = await Promise.race([
@@ -720,7 +823,14 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
 
       // 生命信号：回复文本出现 / 思考态或加载指示器（v6 隔离后每次 ask 均从干净首页开始，
       // 无旧回复，块数基线守卫已剪——qwen 预创建空回答块导致基线永不增长、完成判定失效的教训）
-      const hasSignal = (st) => (st.count > 0 && !!st.text) || !!st.feedback;
+      // continue 模式（v10）恢复基线守卫：会话页上有旧回复，只有"块数超过基线 / 末块文本变化"才算新回复的信号
+      const hasSignal = cont
+        ? (st) => !!st.feedback || !base
+          || st.count > base.count
+          || (st.count === base.count && !!st.text && st.text !== base.text)
+        : (st) => (st.count > 0 && !!st.text) || !!st.feedback;
+      // 是否已见到"本轮的新回复"（continue 模式用于超时与稳定性判定的守卫）
+      let isNewReplySeen = !cont;
 
       // 站点自带的首反馈窗口（严格值：ack 丢失时用它，因为那时无法确认发送是否发生过）
       const siteFirstSignalMs = (SITES[site] && SITES[site].firstSignalMs) || 12000;
@@ -895,6 +1005,15 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
           // 旧实现只回 { text, timedOut }，于是"170 秒里到底有没有内容、有没有流、
           // 正文能不能从流里救回来"完全无从判断（2026-09-15 实测踩过：千问超时返回空正文，
           // 记录里 mdLen/domLen/streamStatus 全是 undefined，等于没有任何线索）。
+          // continue 守卫（v10）：会话页上有旧回复，若本轮没产生任何新回复就把旧答案当超时结果
+          // 返回，等于把上一轮答案冒充本轮结果 —— 必须明确失败。
+          if (cont && !isNewReplySeen && !(bestStream && bestStream.endedAt)) {
+            return sendResult(id, stamp({
+              ok: false, stage: 'generate',
+              detail: `等待超时：会话有历史回复（基线 ${base ? base.count : '?'} 块）但本轮未产生任何新回复`,
+              error: `[${site}][generate] 等待超时：本轮未产生新回复（可能发送未生效或页面已被人操作）`,
+            }));
+          }
           if (bestStream && bestStream.endedAt) {
             // 有已结束且带内容的流：救回正文，比返回空字符串有用得多
             return await finalizeFromStream(bestStream);
@@ -943,6 +1062,13 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
           continue; // 页面跳转中（content script 重建），不计入首反馈窗口，下一轮再取
         }
         if (!st || !st.ok) continue;
+
+        // continue：一旦观测到"新回复出现"（块数超基线 / 末块文本变化），解除各项守卫
+        if (cont && !isNewReplySeen && base
+          && (st.count > base.count || (st.count === base.count && st.text && st.text !== base.text))) {
+          isNewReplySeen = true;
+          console.log(`[webagents] ${site} 检测到本轮新回复（块数 ${base.count} → ${st.count}）`);
+        }
 
         // ---- 风控挑战（滑块验证等）：方案 A ----
         // 站点标签页是后台标签，挑战弹在用户看不见的地方 —— 不处理就表现为"任务无声卡死"。
@@ -1006,7 +1132,8 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
               console.log(`[webagents] ${site} 响应流已关闭 id=${target.id} status=${streamStatus || '未上报'} 正文=${target.markdownLength || 0}字，等待 DOM 追平`);
             }
             // DOM 也稳定（且已给够 400ms 追平时间）或超过收尾上限 → 收口
-            const domSettled = st.count > 0 && st.text
+            // continue 守卫：末块必须真的是本轮新回复（块数超基线/文本有变化），否则可能拿旧答案收口
+            const domSettled = st.count > 0 && st.text && isNewReplySeen
               && st.text === lastText && st.count === lastCount
               && Date.now() - streamEndedSeenAt >= 400;
             if (domSettled || Date.now() - streamEndedSeenAt >= STREAM_SETTLE_MS) {
@@ -1080,6 +1207,14 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
           lastText = st.text || lastText;
           lastCount = st.count || lastCount;
           if (Date.now() > deadline) {
+            // continue 守卫：还在生成就超时，且本轮尚未出现过新回复 → 不能把旧答案当结果
+            if (cont && !isNewReplySeen) {
+              return sendResult(id, stamp({
+                ok: false, stage: 'generate',
+                detail: '等待超时：生成中指示未消失，且本轮未产生任何新回复',
+                error: `[${site}][generate] 等待超时：本轮未产生新回复（生成中指示未消失）`,
+              }));
+            }
             return sendResult(id, stamp({ ok: true, text: lastText, timedOut: true }));
           }
           continue;
@@ -1087,7 +1222,8 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
         const { count, text } = st;
         const now = Date.now();
         // v6 隔离后每次 ask 均从干净首页开始，无旧回复残留，无需基线块数守卫
-        if (count > 0 && text && text === lastText && count === lastCount) {
+        // continue（v10）恢复守卫：末块必须是本轮新回复（isNewReplySeen），否则旧答案两拍就"稳定"了
+        if (isNewReplySeen && count > 0 && text && text === lastText && count === lastCount) {
           if (!stableSince) stableSince = now;
           if (now - stableSince >= 400) {
             await sleep(300); // 复确认

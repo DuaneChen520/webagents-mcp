@@ -9,6 +9,7 @@ bridge.json
 # 工作文档（内部调研/计划，不公开）
 research-*.md
 PLAN-optimization.md
+PLAN-cli-skill.md
 
 # 工作区数据
 .workbuddy/

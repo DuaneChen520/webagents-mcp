@@ -18,9 +18,12 @@
 
 const WS_URL = 'ws://127.0.0.1:8765';
 const RECONNECT_MIN_MS = 1000;
-const RECONNECT_MAX_MS = 30000;
+// 重连上限 5s（v0.4.2）：CLI 化后存在"命令级桥"—— 每条命令自拉桥、命令结束桥即被宿主回收。
+// 本地环回 connect 的失败成本≈0，重连上限必须远小于典型命令窗口，否则扩展与桥会
+// "擦肩而过"（2026-09-15 实测：30s 上限时，10s 的 status 命令全程抓不到重连窗口）。
+const RECONNECT_MAX_MS = 5000;
 const AUTH_RETRY_MS = 60000;      // 握手被拒后的重试间隔（慢速，等桥换令牌）
-const HEALTH_CHECK_MS = 25000;    // 自查连接存活：断开就重连，不依赖外部唤醒
+const HEALTH_CHECK_MS = 10000;    // 自查连接存活：断开就重连，不依赖外部唤醒
 
 let ws = null;
 let backoff = RECONNECT_MIN_MS;

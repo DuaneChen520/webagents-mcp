@@ -147,6 +147,27 @@ Edge 扩展 background.js — 任务路由 / 站点队列 / 完成判定
 
 重启 MCP 客户端后即可调用 `deepseek` / `qwen` 工具。调用时 Edge 中会自动创建/复用对应站点的常驻标签页。
 
+### 4. CLI（v0.5.0 起，skill 封装层的底座）
+
+除 MCP 外，同一桥还提供命令行原语 —— 面向脚本、agent skill 与人：
+
+```bash
+node server/cli.mjs ask deepseek "问题"                 # stdout 一行摘要，正文落盘 outputs/<runId>.md
+node server/cli.mjs ask qwen "审查" --attach a.mjs      # 文件由 CLI 直读拼进 prompt（不过调用方上下文，≤60KB/个）
+node server/cli.mjs ask deepseek --prompt-file p.txt    # 大 prompt 走文件（绕开 argv 32767 字符上限）
+node server/cli.mjs ask deepseek "追问" --continue last # 同会话追问（last / <runId> / here），省上下文重建
+node server/cli.mjs ask deepseek "任务" --schema s.json # JSON 输出+轻校验，违规自动同会话修复一次
+node server/cli.mjs runs --errors / --dedupe / --why last
+node server/cli.mjs inspect deepseek                    # 只读看现场（不导航）
+node server/cli.mjs status                              # 扩展连接状态
+node server/cli.mjs doctor                              # 一键体检（桥/扩展/令牌/版本/失败模式）
+```
+
+设计要点：成功 stdout 只有一行摘要（正文进文件，按需读取）；失败 stdout 一行
+`FAIL stage=<connect|queue|send|challenge|generate|retrieve|quality|session_gone> reason=… hint=… runId=…`
+（退出码 1，用法错误 2）—— 按段定位，不必翻日志。同站点自动串行、跨站点可并行（调用方起后台进程）。
+`--continue` 需要扩展 v0.4.1+（重新加载扩展后生效）。完整参数、判定表与编排剧本见 `skills/webagents/`。
+
 ## 目录结构
 
 ```text
@@ -166,9 +187,11 @@ webagents-mcp/
 │   └── options.html/js   # 完整设置页（与 popup 共用逻辑）
 ├── server/
 │   ├── index.mjs         # MCP stdio server（工具定义与分发 + 运行记录）
+│   ├── cli.mjs           # 命令行原语（ask/runs/inspect/status + 失败七段定位）
 │   ├── bridge.mjs        # WebSocket 桥（127.0.0.1:8765，令牌鉴权 + Origin 校验）
 │   ├── store.mjs         # 本地状态：桥接令牌 + 运行记录（在用户目录，不在仓库里）
 │   └── package.json
+├── skills/webagents/     # agent skill 封装（SKILL.md + 参数参考 + 编排剧本）
 ├── test-client.mjs       # 独立测试客户端（status / 问答 / probe / runs）
 ├── test-stream-parse.mjs # 流解析单元测试
 ├── test-stream-probe.mjs # 流探针集成测试（假 XHR + 假 fetch + 假 WebSocket 驱动）
@@ -176,6 +199,7 @@ webagents-mcp/
 ├── test-bridge-failfast.mjs   # 桥掉线快速失败（起真进程 + 真 WS）
 ├── test-bridge-auth.mjs  # 桥鉴权与配对（令牌 / Origin / TOFU）
 ├── test-offscreen.mjs    # offscreen 连接行为（假 chrome + 假 WebSocket）
+├── test-cli.mjs          # CLI 纯函数 + 失败契约 + 假桥集成（真 CLI 子进程）
 └── test-concurrent-asks.mjs   # 同站点并发验证（需扩展在线）
 ```
 
@@ -224,6 +248,8 @@ node test-concurrent-asks.mjs  # 同站点并发验证：需扩展在线，打�
 - **升级到 0.4.0 需要注意**：桥接令牌改为随机生成，扩展需要重新配对一次。
   重新加载扩展后扩展会发一次不带令牌的连接，桥核对来源后自动下发 —— **无需手工操作**。
   另外正在运行的 MCP 会话仍是旧版 server（硬编码令牌），**需要重启 MCP 会话**才能连上新桥。
+- **0.5.0 起版本口径变化**：`server/package.json` 此前一直停在 0.1.0，现与 `index.mjs` 的 VERSION 一致，并从本版起**与扩展版本独立演进**（扩展侧无改动时 manifest 不跟随升号）。CLI（`server/cli.mjs`）与 MCP 共用同一桥与运行记录。
+- **0.4.2 扩展改动**：offscreen 重连上限 30s → **5s**、连接自查 25s → 10s。背景：CLI 化后存在"命令级桥"（每条命令自拉桥、命令结束桥即被宿主回收），重连上限必须远小于典型命令窗口，否则扩展与桥"擦肩而过"（实测 10s 的 status 命令抓不到 30s 上限的重连窗口）。
 - 「调试」权限已从常驻改为**按需授予**（`optional_permissions`）。如实说明：当前两个站点都不依赖它
   （千问走 `execCommand insertText`，DeepSeek 走原生 setter），保留只为降级备用。需要时在设置页点「授予调试权限」。
 - 改动扩展代码或 `manifest.json` 后，需在 `edge://extensions` **重新加载扩展**才生效

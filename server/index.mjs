@@ -27,7 +27,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.WEBAGENTS_PORT || 8765);
 const TIMEOUT_MS = Number(process.env.WEBAGENTS_TIMEOUT || 300000);
 const WS_URL = `ws://127.0.0.1:${PORT}`;
-const VERSION = '0.4.0';
+// 自 0.5.0 起 server 与扩展版本独立演进（0.5.0 新增 cli.mjs；0.6.0 CLI 增加 continue/protocol/doctor，扩展 0.4.1 增加 continue 支持）
+const VERSION = '0.6.0';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
