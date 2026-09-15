@@ -451,13 +451,15 @@
               stage = 'inject';
             }
             const readBack = () => normalizeText(ADAPTER.readInput ? ADAPTER.readInput(input) : readInputDefault(input));
-            const want = normalizeText(msg.prompt);
+            const want = squashText(msg.prompt);
             let injected = false;
             let injectDetail = '';
             for (let attempt = 1; attempt <= 2 && !injected; attempt++) {
               await (ADAPTER.setValue ? ADAPTER.setValue(input, msg.prompt) : setInputValue(input, msg.prompt));
-              // 注入校验：读回编辑器内容与预期一致（3s 内确认，编辑器回显可能略滞后）
-              if (await verifyWithin(3000, () => readBack() === want)) { injected = true; break; }
+              // 注入校验：空白不敏感比较（P3a 收尾，2026-09-15）。根因实测：Lexical 回显会展开空行
+              // （「。\n\n【」读回「。\n\n\n\n\n【」），squashText 修复函数此前已定义但未接线到本比较，
+              // 严格相等把多空行长 prompt 误判为注入失败（单行 prompt 不受影响，故回归未暴露）。
+              if (await verifyWithin(3000, () => squashText(readBack()) === want)) { injected = true; break; }
               injectDetail = `读回「${readBack().slice(0, 80) || '(空)'}」≠ 预期「${want.slice(0, 80)}」`;
             }
             if (!injected) {
@@ -466,11 +468,13 @@
             }
             stage = 'send';
             const how = await ADAPTER.send(input);
-            const sentOk = await verifyWithin(8000, () =>
+            // 发送验证窗口 25s（2026-09-15 P3b 试点实测）：长 prompt 注入后站点导航/清空明显变慢，
+            // 8s 窗口频繁误报失败（消息实际已发出）；25s 覆盖慢速会话创建。
+            const sentOk = await verifyWithin(25000, () =>
               (ADAPTER.verifySent ? ADAPTER.verifySent(input, msg.prompt) : verifySentDefault(input, msg.prompt)));
             if (!sentOk) {
               const still = normalizeText(readInputDefault(input)).slice(0, 40) || '(空)';
-              sendResponse({ ok: false, stage: 'send', detail: `发送动作(${how})后 8s 未见发送信号，输入框残留「${still}」` });
+              sendResponse({ ok: false, stage: 'send', detail: `发送动作(${how})后 25s 未见发送信号，输入框残留「${still}」` });
               return;
             }
             // 回传首反馈判定基线：发送完成瞬间的回答块数与思考态指示器
