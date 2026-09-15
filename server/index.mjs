@@ -286,6 +286,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         timeoutMs: askTimeout,
       }, askTimeout ? askTimeout + 60000 : undefined);
       runOutcome(entry, r);
+
+      // 空正文判失败（2026-09-16）：站点侧「网络异常」等会让 ask 以 ok=true、正文为空返回。
+      // 记成功会污染运行账——续跑逻辑据此跳过该条、排障时又看错方向（实测踩过：
+      // 一次 11 分钟空等、一次"成功但 md=0"）。这里显式改判并给出可执行的恢复提示。
+      const bodyLen = typeof r.text === 'string' ? r.text.length : (r.text == null ? 0 : String(r.text).length);
+      // 只有"哪儿都没有正文"才判失败；若 DOM/探针侧其实有内容（提取环节的问题），
+      // 不在这里改判，避免把另一类缺陷伪装成空正文。
+      const noContentAnywhere = !(r.domLen > 0) && !(r.mdLen > 0);
+      if (r.ok && bodyLen === 0 && noContentAnywhere) {
+        Object.assign(entry, { ok: false, stage: 'empty_body', error: short('未取到任何正文（空正文）', 300) });
+        const lenInfo = (r.mdLen !== undefined || r.domLen !== undefined)
+          ? `\n[长度快照] mdLen=${r.mdLen} domLen=${r.domLen}` : '';
+        const chInfo = (r.challenge && r.challenge.detected)
+          ? `\n站点仍要求人工验证：${r.challenge.hint}` : '';
+        return fail('执行失败: 未取到任何正文（空正文，stage=empty_body）'
+          + '\nhint: 先 inspect 看页面——若停在「网络异常」提示，点页面「重试」即可继续；'
+          + '若正文已渲染，用 ask --continue here 让其原样重发即可取回（勿盲跑原 prompt）'
+          + chInfo + lenInfo);
+      }
+
       if (!r.ok) {
         // 失败时把当次诊断一并带出：失败原因多半就藏在这里（抓到的流 URL/字段名/DOM 快照）
         const lenInfo = (r.mdLen !== undefined || r.domLen !== undefined)

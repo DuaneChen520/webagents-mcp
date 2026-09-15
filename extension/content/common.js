@@ -293,6 +293,73 @@
     return value;
   }
 
+  /**
+   * 站点侧错误态（2026-09-16）：站点弹出「网络异常」这类提示时生成会停住，
+   * **必须点站点的「重试」按钮才继续**——扩展此前完全不识别该状态，
+   * 表现为"任务无声卡死"（实测两次：一次 RPC 超时 11 分钟、一次报成功但正文为 0）。
+   * 只做识别与代点，不猜语义：页面上**确实存在可见的重试按钮**时才动作。
+   */
+  const SITE_ERROR_RE = /网络异常|网络错误|网络连接|请求失败|服务器繁忙|服务异常|生成失败/;
+  const SITE_RETRY_RE = /^(重试|重新生成|重新回答|再试一次|重试一下|点击重试|Retry)$/i;
+  let siteErrorCache = { at: 0, value: null };
+
+  function visibleEl(el) {
+    return !!el && (el.offsetParent !== null || (el.getClientRects && el.getClientRects().length > 0));
+  }
+
+  /** 找可见的错误提示 + 就近的重试按钮；找不到提示时退化为全页第一个可见重试按钮 */
+  function findSiteRetry() {
+    let errEl = null;
+    try {
+      for (const el of document.querySelectorAll('div,span,p,section,li')) {
+        const t = (el.innerText || '').trim();
+        if (t && t.length < 60 && SITE_ERROR_RE.test(t) && visibleEl(el)) { errEl = el; break; }
+      }
+    } catch { /* 选择器异常忽略 */ }
+    const scope = errEl ? (errEl.closest('div') || errEl.parentElement || document) : document;
+    let btn = null;
+    try {
+      for (const el of scope.querySelectorAll('button,[role="button"],a,div,span')) {
+        const t = (el.innerText || '').trim();
+        if (SITE_RETRY_RE.test(t) && visibleEl(el)) { btn = el; break; }
+      }
+    } catch { /* 选择器异常忽略 */ }
+    return { errEl, btn };
+  }
+
+  function detectSiteError() {
+    const now = Date.now();
+    if (now - siteErrorCache.at < 1000) return siteErrorCache.value; // state 600ms 轮询，节流 1s
+    const { errEl, btn } = findSiteRetry();
+    const value = errEl ? {
+      present: true,
+      sel: errEl.className ? `.${String(errEl.className).split(/\s+/)[0]}` : errEl.tagName.toLowerCase(),
+      label: (errEl.innerText || '').trim().slice(0, 40),
+      retryButton: !!btn,
+    } : null;
+    siteErrorCache = { at: now, value };
+    return value;
+  }
+
+  /** 代点站点「重试」；没按钮就如实回传 false，由上层决定报错而不是空等 */
+  function clickSiteRetry() {
+    const { btn } = findSiteRetry();
+    if (!btn) return { clicked: false, sel: null };
+    const sel = btn.className ? `.${String(btn.className).split(/\s+/)[0]}` : btn.tagName.toLowerCase();
+    try {
+      btn.click();
+      for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        btn.dispatchEvent(t.startsWith('pointer')
+          ? new PointerEvent(t, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' })
+          : new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+      }
+    } catch (e) {
+      return { clicked: false, sel, error: String((e && e.message) || e) };
+    }
+    siteErrorCache = { at: 0, value: null };
+    return { clicked: true, sel };
+  }
+
   /** 思考态/生成中指示器：适配器 thinkingSel 优先，另附跨站宽松兜底 */
   const FEEDBACK_FALLBACK_SEL = [
     '[class*="thinking" i]', '[class*="loading" i]', '[class*="spinner" i]',
@@ -484,6 +551,10 @@
           }
           return;
         }
+        if (msg.type === 'siteRetry') {
+          sendResponse({ ok: true, ...clickSiteRetry() });
+          return;
+        }
         if (msg.type === 'state') {
           const st = answerState(ADAPTER);
           // 流状态：优先取缓存（快路径），否则主动问一次探针。
@@ -502,6 +573,8 @@
             complete: completionState(ADAPTER),
             // 风控挑战（滑块等）检测结果：present=true 时上层会把标签页切到前台并等待人工完成
             challenge: detectChallenge(),
+            // 站点侧错误态（如「网络异常」+「重试」）：需代点重试才能继续生成，见 detectSiteError 注释
+            siteError: detectSiteError(),
             options: ADAPTER.optionState ? ADAPTER.optionState() : null,
             // 探针健康度：即使当前没有流记录，也能知道探针是否可用
             streamProbe: { alive: probeInfo.alive, world: probeInfo.world },

@@ -103,6 +103,17 @@ function firstSignalBudget(acked, siteMs) {
 const CAPTCHA_WAIT_MS = 180000;
 
 /**
+ * 站点侧「网络异常」的代点重试预算（2026-09-16）。
+ *
+ * 现象：站点在生成前弹出「网络异常」提示，扩展侧看不到任何流/文本信号 →
+ * 表现为"任务无声卡死"（实测：RPC 超时 11 分钟；另一次报成功但正文 0 字）。
+ * 该状态只能靠点击站点自己的「重试」按钮恢复，故这里代点，并给重试后的重新等待预算。
+ * 上限 2 次：超过说明不是偶发网络抖动，报错让人介入比继续空等更有用。
+ */
+const SITE_RETRY_MAX = 2;
+const SITE_RETRY_GRACE_MS = 120000;
+
+/**
  * 自适应降温（方案 C）：检测到风控挑战后，自动拉长该站点的调用间隔。
  *
  * 注意定位：它**只是降低再次触发的概率**，不解决已经弹出的挑战
@@ -886,6 +897,8 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
       let completeFalseAt = 0;       // 首次观测到"完成标记=未完成"的时刻（安全阀：超过 90s 视为标记失效）
       let bestStream = null;         // 已见过的"带内容"的流（尾随空流用它回退）
       let challengeSeenAt = 0;       // 首次观测到风控挑战的时刻（present=true）
+      let siteErrorRetried = 0;      // 站点网络异常已代点「重试」的次数（上限 SITE_RETRY_MAX）
+      let siteErrorStuck = false;    // 代点用尽仍异常 → 报错，不再空等
       let challengeSurfacedAt = 0;   // 已把标签页切到前台的时刻
       let challengeClearedAt = 0;    // 挑战消失的时刻
 
@@ -1102,6 +1115,50 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
         if (challengeSeenAt && !challengeClearedAt) {
           challengeClearedAt = Date.now();
           console.log(`[webagents] ${site} 风控挑战已消失（等待 ${Math.round((challengeClearedAt - challengeSeenAt) / 1000)}s），继续完成任务`);
+        }
+
+        // ---- 站点侧错误（「网络异常」+「重试」按钮）----
+        // 只认"提示 + 可见重试按钮"这个组合：生成中的正常状态不会出现重试按钮，
+        // 因此不会误点导致重复生成。代点有上限，用尽即报错——把"要人点一下"如实说出来，
+        // 而不是拖成一次 11 分钟的空等（实测踩过）。
+        const siteErr = st.siteError;
+        if (siteErr && siteErr.present && siteErr.retryButton) {
+          if (siteErrorRetried >= SITE_RETRY_MAX) siteErrorStuck = true;
+          if (!siteErrorStuck) {
+            let clicked = null;
+            try { clicked = await chrome.tabs.sendMessage(tabId, { type: 'siteRetry' }); } catch { clicked = null; }
+            siteErrorRetried += 1;
+            if (clicked && clicked.clicked) {
+              deadline += SITE_RETRY_GRACE_MS; // 重试后重新给生成预算
+              stampBase.siteError = {
+                detected: true, sel: siteErr.sel || null, label: siteErr.label || null,
+                retried: siteErrorRetried,
+                hint: `站点提示网络异常，已自动点「重试」（第 ${siteErrorRetried}/${SITE_RETRY_MAX} 次）`,
+              };
+              console.log(`[webagents] ${site} 站点错误「${siteErr.label || siteErr.sel || '未知'}」→ `
+                + `已代点重试第 ${siteErrorRetried} 次，等待预算 +${SITE_RETRY_GRACE_MS / 1000}s`);
+            } else {
+              siteErrorStuck = siteErrorRetried >= SITE_RETRY_MAX;
+              console.log(`[webagents] ${site} 站点错误态存在但未点到「重试」按钮（第 ${siteErrorRetried} 次）`);
+            }
+          }
+          if (siteErrorStuck) {
+            return sendResult(id, stamp({
+              ok: false,
+              stage: 'site_network_error',
+              detail: `站点提示「${siteErr.label || '网络异常'}」，代点重试 ${siteErrorRetried} 次仍无法继续`,
+              error: `[${site}][site_network_error] 站点侧网络异常，需人工点页面「重试」；`
+                + `若正文其实已渲染，先 inspect 确认，再用 --continue here 让其原样重发取回`,
+            }));
+          }
+          // 异常未消解期间不做完成判定，也别按"站点无反馈"判失败
+          noSignalMs = 0;
+          contentlessEndedAt = Date.now();
+          continue;
+        }
+        if (siteErr && siteErr.present) {
+          // 有异常文案但没有重试按钮：多为瞬时提示，不下结论，交回正常判定
+          stampBase.siteError = { detected: true, label: siteErr.label || null, retryButton: false, hint: '站点提示异常但未找到重试按钮' };
         }
 
         const s = readStream(st);
