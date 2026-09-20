@@ -80,7 +80,8 @@ async function connect() {
   ws.onopen = () => {
     connecting = false;
     backoff = RECONNECT_MIN_MS;
-    const hello = { type: 'hello', role: 'ext' };
+    // hb:1 = 声明「本扩展会应答应用层心跳」，桥据此才启用半开检测（与旧版桥/旧版扩展互相兼容）
+    const hello = { type: 'hello', role: 'ext', hb: 1 };
     if (token) hello.token = token;
     send(hello);
   };
@@ -108,6 +109,8 @@ async function connect() {
       try { ws.close(); } catch {}
       return;
     }
+
+    if (msg.type === 'hb') { send({ type: 'hb-ack', t: msg.t }); return; }
 
     if (msg.type === 'request') {
       // 交给 SW 处理；不等待结果，结果会由 SW 通过 op:'send' 回到这里

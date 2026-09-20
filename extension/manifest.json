@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WebAgents",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "把 DeepSeek / 通义千问等网页版聊天作为 subagent：接收本地 MCP 桥接的请求，注入 prompt 并抓取回复",
   "minimum_chrome_version": "116",
   "permissions": [

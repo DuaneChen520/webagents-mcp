@@ -69,6 +69,39 @@ function onExtGone() {
   }, EXT_GRACE_MS);
 }
 
+/**
+ * 半开检测：应用层心跳（2026-09-20 加）。
+ *
+ * 为什么必须有：上面那套掉线处理全部挂在 socket 的 `close` 事件上，而**机器休眠 / 浏览器被冻结时
+ * 不会有 close**——TCP 没有 FIN，服务端侧 `readyState` 依旧是 1，于是消息发得出去、没人回，
+ * 在飞请求既不失败也不返回，客户端只能等到自己的超时。
+ * 实测现场（runs.jsonl）：一次 ask 记录 ms=7212.9s、stage=connect、queuedMs=0，
+ * 且**失败前后日志里根本没有"扩展断开连接"事件**——"没记录到断开"当时被我读成"没断"。
+ * 心跳的作用就是把这种状态变成"可检测 + 有事件"：连续 HB_MISS 次无应答即判半开，
+ * 直接 terminate 掉这条僵尸连接（触发 onExtGone 让在飞请求快速失败、并让扩展侧自查重连），
+ * 同时把事件写进 runs.jsonl，事后取证才看得见。
+ */
+const HB_MS = Number(process.env.WEBAGENTS_HB_MS || 15000);   // 心跳间隔（测试可压到秒级）
+const HB_MISS = 2;            // 容忍次数：≈45s 内发现半开（远早于 ask 的 300/480s 超时）
+let hbTimer = null;
+let lastHbAck = 0;
+
+function stopHeartbeat() { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } }
+
+function startHeartbeat() {
+  stopHeartbeat();
+  lastHbAck = Date.now();
+  hbTimer = setInterval(() => {
+    if (!ext || ext.readyState !== 1) return;   // 真断开走 close 事件那条路，心跳不管
+    if (Date.now() - lastHbAck < HB_MS * HB_MISS) {
+      try { ext.send(JSON.stringify({ type: 'hb', t: Date.now() })); } catch {}
+      return;
+    }
+    log(`扩展半开：心跳连续 ${HB_MISS} 次无应答（连接名义上仍在），已强制回收该连接`);
+    try { ext.terminate(); } catch { try { ext.close(); } catch {} }   // terminate 不等握手，专治僵尸
+  }, HB_MS);
+}
+
 const log = (msg) => {
   console.error(`[WEBAGENTS-bridge] ${msg}`);
   appendRun({ kind: 'bridge', event: msg });
@@ -152,7 +185,7 @@ wss.on('connection', (ws, req) => {
       }
 
       role = wanted;
-      if (role === 'ext') attachExt(ws);
+      if (role === 'ext') attachExt(ws, msg);
       else clients.add(ws);
       ws.send(JSON.stringify({ type: 'hello-ok', role }));
       return;
@@ -169,6 +202,8 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    if (role === 'ext' && msg.type === 'hb-ack') { lastHbAck = Date.now(); return; }
+
     if (role === 'ext' && msg.type === 'result') {
       const rec = routes.get(msg.id);
       if (rec && rec.client && rec.client.readyState === 1) rec.client.send(JSON.stringify(msg));
@@ -181,6 +216,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (role === 'ext' && ext === ws) {
       ext = null;
+      stopHeartbeat();
       log('扩展断开连接');
       // 不立刻判死在飞请求：先给重连宽限，抖动场景下结果会从新连接回来（见 onExtGone）
       onExtGone();
@@ -192,7 +228,7 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => {});
 });
 
-function attachExt(ws) {
+function attachExt(ws, hello) {
   if (ext && ext !== ws) {
     // 旧扩展连接被顶替。这里同样走宽限：很可能只是 offscreen 文档重连，
     // 而 SW 仍在处理任务、结果会从新连接回来。
@@ -201,5 +237,8 @@ function attachExt(ws) {
     onExtGone();
   }
   ext = ws;
-  log('扩展已接入');
+  // 能力协商：旧扩展（<0.4.3）不会应答 hb。若照样发心跳，它会每隔 ~45s 被误判半开
+  //   并强制重连 —— 部署时「桥先升、扩展后升」是常态，不能制造这种假故障。没协商成功就明确告知不可用。
+  if (hello && hello.hb) { startHeartbeat(); log('扩展已接入（心跳已启用）'); }
+  else { stopHeartbeat(); log('扩展已接入（该扩展未声明心跳能力，半开检测不可用——请升级扩展）'); }
 }
