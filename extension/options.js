@@ -1,4 +1,4 @@
-/** WebAgents 设置（popup / options 共用）：读写用户默认开关（chrome.storage.local 'userDefaults'） */
+/** WebAgents 设置页：同一份 options.html 既当工具栏浮窗也当完整设置页；读写 chrome.storage.local 'userDefaults' */
 const KEY = 'userDefaults';
 
 // 三态分段控件：值存 'on' | 'off' | 'fast' | 'think' | ''（默认=不干预）
@@ -54,45 +54,3 @@ async function save() {
 
 document.addEventListener('DOMContentLoaded', load);
 document.getElementById('save').addEventListener('click', save);
-
-// ---- 「调试」权限：按需授予 ----
-//
-// 为什么要用户点一下才给：chrome.permissions.request() 属于"需要用户手势"的 API，
-// 后台无法静默申请。因此权限只能从这个按钮授予，报错信息也会指到这里。
-const dbgStateEl = () => document.getElementById('debugState');
-
-function paintDebug(has) {
-  const el = dbgStateEl();
-  if (!el) return;
-  el.textContent = has ? '已授权' : '未授权（跑千问前请先授予）';
-  el.classList.toggle('ok', !!has);
-}
-
-async function refreshDebug() {
-  try {
-    const has = await chrome.permissions.contains({ permissions: ['debugger'] });
-    paintDebug(has);
-  } catch { paintDebug(false); }
-}
-
-{
-  const grant = document.getElementById('grantDebug');
-  if (grant) {
-    grant.addEventListener('click', async () => {
-      if (!chrome.permissions || !chrome.permissions.request) return paintDebug(false);
-      try {
-        // 必须在点击回调里直接调用，否则浏览器会拒绝（无用户手势）
-        const granted = await chrome.permissions.request({ permissions: ['debugger'] });
-        paintDebug(granted);
-      } catch { paintDebug(false); }
-    });
-  }
-  const revoke = document.getElementById('revokeDebug');
-  if (revoke) {
-    revoke.addEventListener('click', async () => {
-      try { await chrome.permissions.remove({ permissions: ['debugger'] }); } catch { /* 忽略 */ }
-      refreshDebug();
-    });
-  }
-  if (dbgStateEl()) refreshDebug();
-}

@@ -6,7 +6,7 @@
  * 两者都落在用户私有目录（Windows: %LOCALAPPDATA%\webagents，其它平台 ~/.local/share/webagents）。
  * 需要改位置时设 WEBAGENTS_HOME。
  *
- * 为什么令牌要落盘：桥是单例进程，可能被任意一个 MCP 客户端拉起；
+ * 为什么令牌要落盘：桥是单例进程，可能由任意一条 CLI 命令（或驻留桥）拉起；
  * 令牌必须跨进程、跨重启保持一致，否则每个进程生成一个、互相连不上。
  */
 import fs from 'node:fs';

@@ -18,8 +18,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(path.join(__dirname, 'server', 'index.mjs'));
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(path.join(ROOT, 'server', 'package.json'));
 const { WebSocket } = require('ws');
 
 const PORT = 8798;
@@ -40,7 +41,7 @@ function check(name, actual, expected) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function startBridge() {
-  const child = spawn(process.execPath, [path.join(__dirname, 'server', 'bridge.mjs')], {
+  const child = spawn(process.execPath, [path.join(ROOT, 'server', 'bridge.mjs')], {
     env: { ...process.env, WEBAGENTS_PORT: String(PORT), WEBAGENTS_HOME: HOME, WEBAGENTS_TOKEN: '' },
     stdio: ['ignore', 'ignore', 'ignore'],
   });
@@ -48,7 +49,7 @@ function startBridge() {
 }
 
 /** 尝试握手，返回 { ok, token, error }（不抛异常，便于断言各类拒绝） */
-function hello({ role = 'mcp', token, origin } = {}) {
+function hello({ role = 'cli', token, origin } = {}) {
   return new Promise((resolve) => {
     const opts = origin ? { headers: { Origin: origin } } : {};
     const ws = new WebSocket(URL_, opts);
@@ -83,19 +84,19 @@ check('初始未配对', state && state.pairedAt, null);
 const TOKEN = state ? state.token : '';
 
 console.log('\n[2] 鉴权：错令牌 / 无令牌一律拒绝');
-check('无令牌的 mcp 连接被拒', (await hello({ role: 'mcp' })).ok, false);
-check('错令牌被拒', (await hello({ role: 'mcp', token: 'webagents-local' })).ok, false);
+check('无令牌的 cli 连接被拒', (await hello({ role: 'cli' })).ok, false);
+check('错令牌被拒', (await hello({ role: 'cli', token: 'webagents-local' })).ok, false);
 check('旧硬编码令牌无效（关键：堵住默认值）',
-  (await hello({ role: 'mcp', token: 'webagents-local' })).error, '令牌不匹配');
-check('正确令牌通过', (await hello({ role: 'mcp', token: TOKEN })).ok, true);
+  (await hello({ role: 'cli', token: 'webagents-local' })).error, '令牌不匹配');
+check('正确令牌通过', (await hello({ role: 'cli', token: TOKEN })).ok, true);
 
 console.log('\n[3] Origin 校验：网页来源一律拒绝');
 {
-  const r = await hello({ role: 'mcp', token: TOKEN, origin: 'https://evil.example' });
+  const r = await hello({ role: 'cli', token: TOKEN, origin: 'https://evil.example' });
   check('带网页 Origin 的连接被拒（即使令牌正确）', r.ok, false);
 }
 {
-  const r = await hello({ role: 'mcp', token: TOKEN, origin: 'http://localhost:3000' });
+  const r = await hello({ role: 'cli', token: TOKEN, origin: 'http://localhost:3000' });
   check('localhost 网页来源同样被拒', r.ok, false);
 }
 

@@ -4,9 +4,15 @@
  *
  * 角色路由：
  *   - ext  ：WEBAGENTS Edge 扩展（唯一的扩展连接，新连接顶掉旧的）
- *   - mcp  ：一个或多个 MCP server 实例（Trae 会话、测试客户端可共存）
+ *   - cli  ：一个或多个命令行调用方（cli.mjs 的每条命令、测试客户端可共存）
  *
- * 消息流：mcp 发 request{id,...} → 转发给 ext；ext 回 result{id,...} → 按 id 路由回发起的 mcp。
+ * 消息流：cli 发 request{id,...} → 转发给 ext；ext 回 result{id,...} → 按 id 路由回发起的 cli。
+ *
+ * 请求 id 的责任在调用方：**必须全局唯一**（不能只在各自进程内唯一）。
+ * 桥按 id 索引在飞请求，两个进程都用 "cli-1" 会让后注册者顶掉前者 ——
+ * 前者的结果被投给后者（答案张冠李戴，比失败更难查），前者干等到自己的超时。
+ * 09-21 实测：两个客户端同时发 id=cli-1，三次全部复现"B 要 qwen 却拿到 deepseek、A 一无所获"。
+ * 桥侧加了冲突守卫（见 routes），但那只是把静默错误变成明确报错，不能替代唯一 id。
  *
  * 安全（v0.4.0 起，此前完全裸奔）：
  *   1. 令牌不再硬编码。优先 env WEBAGENTS_TOKEN，其次用户目录下的 bridge.json（随机生成）。
@@ -32,7 +38,7 @@ rotateRuns();
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken({ create: true });
 
 let ext = null;               // 扩展连接
-const clients = new Set();    // mcp 客户端连接
+const clients = new Set();    // 调用方（cli.mjs）连接
 const routes = new Map();     // request id -> { client, at }
 
 /**
@@ -70,9 +76,9 @@ function onExtGone() {
 }
 
 /**
- * 半开检测：应用层心跳（2026-09-20 加）。
+ * 半开检测：应用层心跳（2026-09-20 加，2026-09-21 扩到两侧）。
  *
- * 为什么必须有：上面那套掉线处理全部挂在 socket 的 `close` 事件上，而**机器休眠 / 浏览器被冻结时
+ * 为什么必须有：掉线处理全部挂在 socket 的 `close` 事件上，而**机器休眠 / 浏览器被冻结时
  * 不会有 close**——TCP 没有 FIN，服务端侧 `readyState` 依旧是 1，于是消息发得出去、没人回，
  * 在飞请求既不失败也不返回，客户端只能等到自己的超时。
  * 实测现场（runs.jsonl）：一次 ask 记录 ms=7212.9s、stage=connect、queuedMs=0，
@@ -80,27 +86,39 @@ function onExtGone() {
  * 心跳的作用就是把这种状态变成"可检测 + 有事件"：连续 HB_MISS 次无应答即判半开，
  * 直接 terminate 掉这条僵尸连接（触发 onExtGone 让在飞请求快速失败、并让扩展侧自查重连），
  * 同时把事件写进 runs.jsonl，事后取证才看得见。
+ *
+ * 为什么两侧都要（09-21）：线有两段（调用方↔桥、桥↔扩展），休眠时是两段一起僵。
+ * 只保后半段的话，桥判出半开、把失败通知发给前半段那条同样已经废了的线，
+ * 照样是"发进空气"（见 failRoutes 的投递判定）。
+ *
+ * 兼容性：只有在 hello 里自报 `hb:1` 的连接才参与半开判定 —— 部署时「桥先升、扩展后升」
+ * 是常态，无条件发心跳会让旧扩展每隔 ~45s 被误判半开并强制重连，那是我们自己造的假故障。
  */
 const HB_MS = Number(process.env.WEBAGENTS_HB_MS || 15000);   // 心跳间隔（测试可压到秒级）
-const HB_MISS = 2;            // 容忍次数：≈45s 内发现半开（远早于 ask 的 300/480s 超时）
-let hbTimer = null;
-let lastHbAck = 0;
+const HB_MISS = 2;            // 容忍次数：≈30s 内发现半开（远早于 ask 的 300/480s 超时）
 
-function stopHeartbeat() { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } }
-
-function startHeartbeat() {
-  stopHeartbeat();
-  lastHbAck = Date.now();
-  hbTimer = setInterval(() => {
-    if (!ext || ext.readyState !== 1) return;   // 真断开走 close 事件那条路，心跳不管
-    if (Date.now() - lastHbAck < HB_MS * HB_MISS) {
-      try { ext.send(JSON.stringify({ type: 'hb', t: Date.now() })); } catch {}
-      return;
-    }
-    log(`扩展半开：心跳连续 ${HB_MISS} 次无应答（连接名义上仍在），已强制回收该连接`);
-    try { ext.terminate(); } catch { try { ext.close(); } catch {} }   // terminate 不等握手，专治僵尸
-  }, HB_MS);
+/** 握手时给这条连接装活性跟踪：没自报会应答的一律不装（旧端） */
+function armHeartbeat(ws) {
+  if (!ws.helloHb) return;
+  ws.hbAckAt = Date.now();
+  ws.hbArmed = true;
 }
+
+/** 这条连接是否还在听（未参与心跳的旧连接无从判断，按"可用"处理，与加心跳之前一致） */
+const isLive = (ws) => !!ws && (!ws.hbArmed || Date.now() - ws.hbAckAt < HB_MS * HB_MISS);
+
+setInterval(() => {
+  for (const ws of [ext, ...clients]) {
+    if (!ws || !ws.hbArmed || ws.readyState !== 1) continue;
+    if (isLive(ws)) {
+      try { ws.send(JSON.stringify({ type: 'hb', t: Date.now() })); } catch {}
+      continue;
+    }
+    const who = ws === ext ? '扩展' : '调用方';
+    log(`${who}半开：心跳连续 ${HB_MISS} 次无应答（连接名义上仍在），已强制回收该连接`);
+    try { ws.terminate(); } catch { try { ws.close(); } catch {} }   // terminate 不等握手，专治僵尸
+  }
+}, HB_MS);
 
 const log = (msg) => {
   console.error(`[WEBAGENTS-bridge] ${msg}`);
@@ -110,19 +128,29 @@ const log = (msg) => {
 /**
  * 让在飞请求失败。默认全部；传 beforeTs 时只失败该时刻之前发出的请求
  * （用于"重连后仍未返回结果"的场景 —— 新发的请求不该被旧故障连坐）。
+ *
+ * 投递前先判这条线是否还活着（09-21）：`readyState===1` 只代表"名义上通着"，
+ * 半开时 send 会进发送缓冲、既不报错也不回调，而旧实现一 send 就当送达并删掉记录 ——
+ * 结果调用方仍在等，日志却写着"已让 N 个请求失败"。宁可如实说"通知送不出去"。
  */
 function failRoutes(reason, beforeTs) {
   if (!routes.size) return;
-  let n = 0;
+  let delivered = 0;
+  let undeliverable = 0;
   for (const [id, rec] of routes) {
     if (!rec || (beforeTs && rec.at > beforeTs)) continue;
-    if (rec.client && rec.client.readyState === 1) {
+    if (rec.client && rec.client.readyState === 1 && isLive(rec.client)) {
       rec.client.send(JSON.stringify({ type: 'result', id, ok: false, error: reason }));
-      n++;
+      delivered++;
+    } else {
+      undeliverable++;
     }
     routes.delete(id);
   }
-  if (n) log(`已让 ${n} 个在飞请求失败：${reason}`);
+  if (delivered) log(`已让 ${delivered} 个在飞请求失败：${reason}`);
+  if (undeliverable) {
+    log(`${undeliverable} 个在飞请求的失败通知送不出去（该连接半开或已关闭），调用方会等到自己的超时：${reason}`);
+  }
 }
 
 const wss = new WebSocketServer({ host: '127.0.0.1', port: PORT });
@@ -141,7 +169,7 @@ wss.on('listening', () => {
 
 wss.on('error', (err) => {
   if (err && err.code === 'EADDRINUSE') {
-    log(`端口 ${PORT} 已被占用 —— 本机应只有一个桥（检查是否有残留进程，或另开一个 MCP 会话在跑）`);
+    log(`端口 ${PORT} 已被占用 —— 本机应只有一个桥（检查是否有残留进程，或另有一条 CLI 命令/驻留桥在跑）`);
   } else {
     log(`WebSocket 服务出错：${(err && err.message) || err}`);
   }
@@ -165,7 +193,8 @@ wss.on('connection', (ws, req) => {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.type === 'hello') {
-      const wanted = msg.role === 'mcp' ? 'mcp' : 'ext';
+      const wanted = msg.role === 'ext' ? 'ext' : 'cli';
+      ws.helloHb = !!msg.hb;        // 对端是否自报"会应答心跳"（装不装半开检测的依据）
 
       if (msg.token === TOKEN) {
         // 正常路径
@@ -175,6 +204,7 @@ wss.on('connection', (ws, req) => {
         markPaired(origin);
         log(`扩展配对成功（来源=${origin || '未上报 Origin'}${msg.token ? '，原令牌已失效' : ''}），令牌已下发`);
         role = 'ext';
+        armHeartbeat(ws);          // 必须在 attachExt 之前：那里的日志要读 hbArmed
         attachExt(ws);
         ws.send(JSON.stringify({ type: 'hello-ok', role, token: TOKEN }));
         return;
@@ -185,7 +215,11 @@ wss.on('connection', (ws, req) => {
       }
 
       role = wanted;
-      if (role === 'ext') attachExt(ws, msg);
+      // 心跳在**两条握手路径上都要装**：09-21 前的实现只在 attachExt 里按 hello.hb 启用，
+      // 而 TOFU 配对那条路没传 hello —— 于是"首次安装"和"扩展存储被清空后自愈"这两条
+      // 恰好最需要保护的路径永远没有半开检测。
+      armHeartbeat(ws);
+      if (role === 'ext') attachExt(ws);
       else clients.add(ws);
       ws.send(JSON.stringify({ type: 'hello-ok', role }));
       return;
@@ -193,16 +227,30 @@ wss.on('connection', (ws, req) => {
 
     if (!role) return;
 
-    if (role === 'mcp' && msg.type === 'request') {
+    if (msg.type === 'hb-ack') {
+      if (ws.hbArmed) ws.hbAckAt = Date.now();
+      return;
+    }
+
+    if (role === 'cli' && msg.type === 'request') {
       if (!ext || ext.readyState !== 1) {
         return ws.send(JSON.stringify({ type: 'result', id: msg.id, ok: false, error: 'WEBAGENTS 扩展未连接（请在 Edge 中确认扩展已启用且浏览器已打开）' }));
+      }
+      // id 冲突守卫：静默覆盖会把前一个调用方的结果投给后一个（张冠李戴），
+      // 而前者只能干等到超时。这里如实拒绝后来者，让它换个唯一 id 重来。
+      if (routes.has(msg.id)) {
+        const from = routes.get(msg.id);
+        log(`请求 id 冲突：${msg.id} 已在飞（来自另一条连接），已拒绝后来者 —— 调用方的请求 id 必须全局唯一`);
+        return ws.send(JSON.stringify({
+          type: 'result', id: msg.id, ok: false,
+          error: `请求 id 冲突（${msg.id} 正被另一个调用方使用）：桥按 id 路由结果，重复会串到别人手里。请升级调用方（0.7.0 起 id 带进程唯一前缀）`,
+          from,
+        }));
       }
       routes.set(msg.id, { client: ws, at: Date.now() });
       ext.send(JSON.stringify(msg));
       return;
     }
-
-    if (role === 'ext' && msg.type === 'hb-ack') { lastHbAck = Date.now(); return; }
 
     if (role === 'ext' && msg.type === 'result') {
       const rec = routes.get(msg.id);
@@ -210,13 +258,12 @@ wss.on('connection', (ws, req) => {
       routes.delete(msg.id);
       return;
     }
-    // ping 等其它消息直接忽略
+    // 其它消息直接忽略
   });
 
   ws.on('close', () => {
     if (role === 'ext' && ext === ws) {
       ext = null;
-      stopHeartbeat();
       log('扩展断开连接');
       // 不立刻判死在飞请求：先给重连宽限，抖动场景下结果会从新连接回来（见 onExtGone）
       onExtGone();
@@ -228,7 +275,7 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => {});
 });
 
-function attachExt(ws, hello) {
+function attachExt(ws) {
   if (ext && ext !== ws) {
     // 旧扩展连接被顶替。这里同样走宽限：很可能只是 offscreen 文档重连，
     // 而 SW 仍在处理任务、结果会从新连接回来。
@@ -237,8 +284,5 @@ function attachExt(ws, hello) {
     onExtGone();
   }
   ext = ws;
-  // 能力协商：旧扩展（<0.4.3）不会应答 hb。若照样发心跳，它会每隔 ~45s 被误判半开
-  //   并强制重连 —— 部署时「桥先升、扩展后升」是常态，不能制造这种假故障。没协商成功就明确告知不可用。
-  if (hello && hello.hb) { startHeartbeat(); log('扩展已接入（心跳已启用）'); }
-  else { stopHeartbeat(); log('扩展已接入（该扩展未声明心跳能力，半开检测不可用——请升级扩展）'); }
+  log(`扩展已接入${ws.hbArmed ? '（心跳已启用）' : '（该扩展未声明心跳能力，半开检测不可用——请升级扩展）'}`);
 }

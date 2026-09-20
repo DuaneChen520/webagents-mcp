@@ -1,11 +1,10 @@
 {
   "name": "WEBAGENTS-server",
-  "version": "0.6.0",
-  "description": "MCP stdio server + WS bridge: dispatch prompts to chat web UIs via the WEBAGENTS Edge extension",
+  "version": "0.7.0",
+  "description": "单例 WebSocket 桥 + CLI 原语：把 prompt 派发给网页版聊天 UI，经 WEBAGENTS Edge 扩展取回回复",
   "type": "module",
-  "main": "index.mjs",
+  "main": "cli.mjs",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
     "ws": "^8.18.0"
   }
 }

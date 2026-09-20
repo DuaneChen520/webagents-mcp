@@ -21,7 +21,7 @@
 
   const PARSE = window.__WEBAGENTS_STREAM_PARSE__;
   if (!PARSE) return;   // 解析模块未加载（manifest js 顺序错误）→ 放弃探针，但不影响站点
-  const { applyOp, mergeDeep, mergeFragments, appendDelta, noteStatus, harvestStatus, extractMarkdown, parseChunk, statusFromEvent } = PARSE;
+  const { applyOp, mergeDeep, mergeFragments, appendDelta, noteStatus, harvestStatus, extractMarkdown, parseChunk, statusFromEvent, findFragmentArray } = PARSE;
 
   const PROBE = 'webagents-probe';
   /**
@@ -85,6 +85,33 @@
       opCount: 0,
       offset: 0,
       sample: '',
+      // 头部样本：sample 只留尾部，而"丢头"类问题要看的是**最前面那几帧的原文** ——
+      // 没有它只能靠帧计数猜（2026-09-21 就是这样连猜错两次）。
+      head: '',
+      /**
+       * "答案片段第一次出现"前后的帧窗口（verbatim）。
+       * 丢头有两种长相相同的成因，只有这几帧能分辨：
+       *   A 答案的头几个增量先于 RESPONSE 片段到达、被并进 THINK，随后又被结构帧整段覆盖掉；
+       *   B 那几帧根本没被探针看到。
+       * 上一轮想用 THINK 的 tail 判别 A，但 mergeDeep 对字符串是直接赋值（content 会被重写），
+       * A 的残留会被抹平 —— 所以必须留帧原文。
+       */
+      answerStart: null,
+      // 正文增量按"落到哪个片段类型"的字数记账（到达即记，见 ingest 里的说明）
+      deltaByKind: {},
+      // 其中在 has_pending_fragment=true 期间到达的部分（修法判据）
+      pendingByKind: {},
+      /**
+       * 所有碰过 content 的**路径操作**帧原文（有界）。
+       * 为什么要它：裸 `{v:"字"}` 增量记在 deltaByKind 里，而路径操作不记 ——
+       * 2026-09-21 实抓的算术差口正是这个：RESPONSE 最终 9 字、裸增量只 7 字，
+       * 缺的 2 字只能来自一帧 `{"p":"…/content","o":"SET",…}`，而 SET 是**覆盖**不是追加。
+       * 没有逐帧原文就只能像之前几轮那样靠聚合数猜（已猜错三次）。
+       */
+      contentOps: [],
+      frameRing: [],       // 最近 6 帧原文，用于在切换点回看前几帧
+      // 缺 `o` 且写 content 的帧数：见 ingest 处的说明
+      noOpContentWrites: 0,
       rawTexts: [],        // 裸字符串负载的样本（不并入正文，仅诊断用）
       frames: {},          // 帧形态统计：一次实跑就能判断站点用了哪种负载
       root: {},
@@ -118,9 +145,38 @@
     return false;
   }
 
+  /** 与 stream-parse 的 NON_ANSWER_TYPE 对齐：这些类型的片段是思考/工具，不是正文 */
+  const NON_ANSWER_KIND = /^(THINK|THINKING|COT|TOOL|SEARCH|WEB_SEARCH)/;
+  /** 一个对象长得像片段吗（带 type/mimeType 就认） */
+  const fragKindOf = (o) => (o && typeof o === 'object' && typeof (o.type || o.mimeType) === 'string')
+    ? String(o.type || o.mimeType).toUpperCase() : null;
+  /**
+   * 这一帧是否把"正式回答片段"结构带了出来 —— 即思考→答案的切换点。
+   * 三种下发形态都要认（上一版只认第一种，结果现场没触发）：
+   *   ① {v:{response:{fragments:[…]}}}   整块结构
+   *   ② {v:[…]}                          数组直发
+   *   ③ {p:"response/fragments/-1", v:{id,type,content}}  路径操作直接下发单个片段
+   */
+  function introducesAnswerFrame(one) {
+    const v = one && one.v;
+    if (!v || typeof v !== 'object') return false;
+    const cands = [];
+    if (Array.isArray(v)) cands.push(...v);
+    else {
+      if (v.response && Array.isArray(v.response.fragments)) cands.push(...v.response.fragments);
+      const direct = fragKindOf(v);
+      if (direct) cands.push(Object.assign({ type: direct }, v));
+    }
+    return cands.some((f) => {
+      const k = fragKindOf(f);
+      return !!k && !NON_ANSWER_KIND.test(k);
+    });
+  }
+
   function ingest(rec, chunk) {
     if (!chunk) return;
     rec.sample = (rec.sample + chunk).slice(-MAX_SAMPLE);
+    if (rec.head.length < MAX_SAMPLE) rec.head = (rec.head + chunk).slice(0, MAX_SAMPLE);
     const stats = { frames: rec.frames };
     for (const raw of parseChunk(chunk, stats)) {
       // 裸字符串负载：留样本，不并入正文（可能是风控遥测，混进去会污染答案）
@@ -136,14 +192,52 @@
         if (!rec.events.includes(ev)) rec.events.push(ev);
         rec.noteStatus(statusFromEvent(ev, rec.status));
       }
+      // —— 帧窗口留证（6 帧、每帧 180 字，代价可忽略）：定位"答案是从哪一帧开始的" ——
+      try {
+        const line = JSON.stringify(one).slice(0, 180);
+        rec.frameRing.push(line);
+        while (rec.frameRing.length > 6) rec.frameRing.shift();
+        if (!rec.answerStart && introducesAnswerFrame(one)) {
+          rec.answerStart = { atOp: rec.opCount, prev: rec.frameRing.slice(0, -1), frame: line };
+        }
+      } catch { /* 序列化不了不影响解析 */ }
       harvestStatus(one, rec.noteStatus);
       if (typeof one.p === 'string' && (one.o || one.v !== undefined)) {
+        // 把"缺 o 的 content 写入"这件事本身变成可观测计数：解析器现在按追加处理是对的，
+        // 但它依赖的是"站点对 content 用追加语义"这一实测约定。哪一天站点改回 SET 语义，
+        // 这个计数会先动 —— 比事后发现"答案又丢头"早得多（本轮为定位它实抓了六次）。
+        if (!one.o && /content$/.test(one.p) && typeof one.v === 'string') rec.noOpContentWrites++;
+        if (/content|fragments/.test(one.p) && rec.contentOps.length < 40) {
+          rec.contentOps.push({
+            atOp: rec.opCount, p: one.p, o: one.o,
+            v: typeof one.v === 'string' ? one.v.slice(0, 24) : JSON.stringify(one.v).slice(0, 140),
+            vLen: typeof one.v === 'string' ? one.v.length : null,
+          });
+        }
         applyOp(rec.root, one);
         rec.opCount++;
       } else if (one.v && typeof one.v === 'object' && !Array.isArray(one.v)) {
         mergeDeep(rec.root, one.v);
         rec.opCount++;
       } else if (typeof one.v === 'string' && one.v) {
+        // **到达即记账**：这片正文增量落到的是哪种片段。
+        // 必须在应用那一刻记，不能事后看片段内容 —— content 会被后续结构帧整段覆盖
+        // （mergeDeep 对字符串是直接赋值），被吞掉的头几个字到时候早已不留痕迹。
+        // 用法：deltaByKind 与 frags 的 len 对不上，差值就是"落错片段"的字数。
+        try {
+          const frags = findFragmentArray(rec.root);
+          const tail = frags && frags.length ? frags[frags.length - 1] : null;
+          const kind = String((tail && (tail.type || tail.mimeType)) || '(无片段)').toUpperCase();
+          rec.deltaByKind = rec.deltaByKind || {};
+          rec.deltaByKind[kind] = (rec.deltaByKind[kind] || 0) + one.v.length;
+          // 站点自己说"还有片段没下发"时，我们却只有思考片段可写 —— 这批字数就是修法判据：
+          // 修法应当依这个标记切分，而不是在提取侧猜（猜过一次，错了）。
+          const pending = !!(rec.root && rec.root.response && rec.root.response.has_pending_fragment);
+          if (pending) {
+            rec.pendingByKind = rec.pendingByKind || {};
+            rec.pendingByKind[kind] = (rec.pendingByKind[kind] || 0) + one.v.length;
+          }
+        } catch { /* 记账失败不影响解析 */ }
         appendDelta(rec.root, one.v);
         rec.opCount++;
       } else if (Array.isArray(one.v)) {
@@ -404,6 +498,28 @@
         markdownHead: rec.text.slice(0, 500),
         rootKeys: Object.keys(rec.root || {}),
         responseKeys: rec.root && rec.root.response ? Object.keys(rec.root.response) : [],
+        // 片段清单（类型 + 长度 + 首尾）：**判断"正文归没归对片段"的直接证据**。
+        // 2026-09-21 实抓两例：页面 7 字我们回 4 字、页面 12 字我们回 11 字，丢的都在**开头**，
+        // 且 THINK 片段紧挨在 RESPONSE 前面 —— 光看 markdownLength 分不清"没收到"还是
+        // "收到了但塞进了 THINK、被 extractMarkdown 按类型过滤掉"，所以首尾都要给。
+        frags: (() => {
+          const frags = findFragmentArray(rec.root);
+          if (!Array.isArray(frags)) return null;
+          return frags.slice(0, 12).map((f) => ({
+            kind: String((f && (f.type || f.mimeType)) || '').slice(0, 24),
+            len: typeof f.content === 'string' ? f.content.length : -1,
+            head: typeof f.content === 'string' ? f.content.slice(0, 24) : '',
+            tail: typeof f.content === 'string' ? f.content.slice(-24) : '',
+          }));
+        })(),
+        // 站点自己的"还有片段没下发"标记 + 思考态：答案头几个字疑似被前一个片段吞掉时，
+        // 这两个字段决定修法是靠该标记切分，还是只能在 extractMarkdown 侧兜。
+        pendingFragment: (rec.root && rec.root.response && rec.root.response.has_pending_fragment) ?? null,
+        thinkingEnabled: (rec.root && rec.root.response && rec.root.response.thinking_enabled) ?? null,
+        fragmentCount: (() => {
+          const frags = findFragmentArray(rec.root);
+          return Array.isArray(frags) ? frags.length : -1;
+        })(),
         // 事件词表：站点协议的直接证据。"status 一直为空"时看这里就能判断
         // 是"没有命名事件"还是"事件名不在我们的终态词表里"。
         events: rec.events.slice(0, 20),
@@ -412,6 +528,15 @@
         frames: rec.frames,
         rawTexts: rec.rawTexts.map((t) => String(t).slice(0, 200)),
         sample: rec.sample.slice(-1500),
+        headSample: rec.head,
+        // 思考→答案切换点的帧原文（含其前 5 帧）
+        answerStart: rec.answerStart,
+        // 到达即记账：每个片段类型收到过多少字的正文增量
+        deltaByKind: rec.deltaByKind,
+        pendingByKind: rec.pendingByKind,
+        // 碰过 content/fragments 的路径操作逐帧原文（查 SET 覆盖类丢字的唯一硬证据）
+        contentOps: rec.contentOps,
+        noOpContentWrites: rec.noOpContentWrites,
       } : null,
       // **本页跟踪到的所有流**的摘要。决定性证据：一次问答可能有多条流
       // （风控预审 + 正式作答），只看"最新一条"会误判成"没有答案流"。

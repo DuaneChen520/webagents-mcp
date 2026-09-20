@@ -11,8 +11,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SRC = path.join(__dirname, 'extension', 'content', 'stream-parse.js');
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const SRC = path.join(ROOT, 'extension', 'content', 'stream-parse.js');
 
 // 在伪造的 window 上执行模块（模块同时兼容 window 与 CommonJS 两种暴露方式）
 const win = {};
@@ -417,6 +418,41 @@ console.log('\n[10] 统计器：一次实跑就能判断站点用了哪种负载
   check('结束标记计数', s.frames.done, 1);
   check('坏帧计数', s.frames.badJson, 1);
   check('不传统计器也不报错', P.parseChunk('data: {"a":1}').length, 1);
+}
+
+console.log('\n[10] 缺 `o` 的路径操作帧＝追加，不是覆盖（2026-09-21 实抓"丢头"五连的元凶）');
+{
+  // 现场帧（逐字照抄实抓）：站点先用一帧把 RESPONSE 片段连同答案首字符内联下发，
+  // 紧接着再来一帧**只带 {p,v}、不带 o** 的 content 写入：
+  //   at63 {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"K",…}]}
+  //   at64 {"p":"response/fragments/-1/content","v":"IL"}
+  // 旧实现 `if (APPEND) … else write(v)` 把"没有 o"落到 else 当 SET，于是内联的首字符被抹掉。
+  // 五次真跑分别丢 X / MK / BRA / HEAD / G / K —— N 恒等于创建帧内联 content 的长度。
+  const root = {};
+  P.mergeDeep(root, { response: { status: 'WIP', fragments: [{ id: 2, type: 'THINK', content: '我们需要' }] } });
+  P.applyOp(root, { p: 'response/fragments/-1/content', o: 'APPEND', v: '回答' });
+  P.appendDelta(root, '用户');
+  P.applyOp(root, { p: 'response/fragments', o: 'APPEND',
+    v: [{ id: 3, type: 'RESPONSE', content: 'K', references: [], stage_id: 1 }] });
+  P.applyOp(root, { p: 'response/fragments/-1/content', v: 'IL' });
+  ['O', '-', '5', '5', '5'].forEach((c) => P.appendDelta(root, c));
+  check('缺 o 帧保住内联首字符（旧实现返回 ILO-555）', P.extractMarkdown(root), 'KILO-555');
+  check('思考片段不受影响', P.findFragmentArray(root).find((f) => f.type === 'THINK').content, '我们需要回答用户');
+
+  // 缺 o 但整段重发（累积式）时仍按替换处理，不能把正文重复一遍
+  const acc = { fragments: [{ id: 1, type: 'RESPONSE', content: 'AB' }] };
+  P.applyOp(acc, { p: 'fragments/-1/content', v: 'ABCD' });
+  check('缺 o + 累积式重发 → 替换而非重复', P.extractMarkdown(acc), 'ABCD');
+
+  // 显式 SET 依然忠实覆盖：放宽"缺 o"不等于否定 SET
+  const set = { fragments: [{ id: 1, type: 'RESPONSE', content: 'OLD' }] };
+  P.applyOp(set, { p: 'fragments/-1/content', o: 'SET', v: 'NEW' });
+  check('显式 SET 仍覆盖', P.extractMarkdown(set), 'NEW');
+
+  // 结构帧的空 content 不许冲掉已到达的正文（同一类"被结构帧抹掉"的漏修分支）
+  const wipe = { response: { fragments: [{ id: 3, type: 'RESPONSE', content: 'PAYLOAD' }] } };
+  P.mergeDeep(wipe, { response: { fragments: [{ id: 3, type: 'RESPONSE', content: '' }] } });
+  check('空 content 结构帧不冲掉正文', P.extractMarkdown(wipe), 'PAYLOAD');
 }
 
 console.log(`\n结果：通过 ${pass} 项，失败 ${fail} 项\n`);

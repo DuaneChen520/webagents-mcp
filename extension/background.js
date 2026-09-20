@@ -10,7 +10,6 @@
  * 注意：内容脚本负责页面内的等待与抓取；SW 只做路由。
  */
 
-const WS_URL = 'ws://127.0.0.1:8765';
 const OFFSCREEN_PATH = 'offscreen.html';
 const TOKEN_KEY = 'bridgeToken';   // 桥接令牌存在 chrome.storage.local（首次连接由桥配对下发）
 
@@ -37,6 +36,31 @@ const SITES = {
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 与内容脚本的一次往返，**必须带硬超时**。
+ *
+ * 为什么：chrome.tabs.sendMessage 的 Promise 只在对端"不存在/明确关通道"时才 reject。
+ * 内容脚本的监听器是无条件 `return true`（异步再 sendResponse）的，所以它一旦在自己的
+ * async 处理链里抛出而没走到 sendResponse，这个 await 就**永远不 settle**。
+ * 挂住的也不只是"这一轮轮询"：ask 任务在 await 里出不来，站点级串行队列被一直占着，
+ * 后面的同站点任务连"排队超时"都判不到（那是被调度到才检查的），调用方只能等到自己的天花板。
+ *
+ * 2026-09-21 实测：扩展重载后两条并发 ask 全部顶到 360s 客户端超时；13 分钟后 status 仍显示
+ * `排队中: deepseek=1`，而同一时刻 ping 3ms 就有应答（SW 没被回收）——
+ * 说明任务卡死在这里，而不是 170s 的预算不够。
+ *
+ * 超时之后按"这一轮没拿到状态"处理（调用方本来就要 catch），让轮询循环能继续走到预算检查，
+ * 并最终带着 stage/诊断返回，而不是无声地挂死。
+ */
+function tabsCall(tabId, msg, timeoutMs = 15000) {
+  return Promise.race([
+    chrome.tabs.sendMessage(tabId, msg),
+    sleep(timeoutMs).then(() => {
+      throw new Error(`内容脚本 ${timeoutMs / 1000}s 无响应（type=${msg.type}）`);
+    }),
+  ]);
+}
 
 /**
  * 站点自报终态 → 人类可读说明（v8）
@@ -214,11 +238,11 @@ function enqueueSite(site, fn, waitLimitMs = QUEUE_WAIT_MS) {
 // 收发消息时被唤醒。这样做的直接收益：**SW 回收不再中断连接** ——
 // 否则"掉线快速失败"会对一次正常的 SW 回收误报成请求失败。
 //
-// offscreen 不可用的环境（理论上只有 Chrome < 109）退回 SW 内直连，功能不缺席。
+// 原先还有一条「offscreen 不可用就退回 SW 内直连」的分支，已删（0.7.0）：
+// 它的前提是 chrome.offscreen 不存在，而该 API 自 Chrome/Edge 109 起就有，
+// manifest 又声明了 minimum_chrome_version: 116 —— 分支永不执行，
+// 却让每个读连接代码的人都要多判一支，也让 ping 的"连没连上"有两套说法。
 
-let transport = 'offscreen';       // 'offscreen' | 'sw'
-let swWs = null;                   // 仅退回模式使用
-let swBackoff = 1000;
 let cachedToken = null;
 let bridgeState = { connected: false, error: '尚未连接', at: 0 };
 
@@ -238,9 +262,6 @@ async function saveToken(t) {
 
 let creatingOffscreen = null;
 async function ensureOffscreen() {
-  if (transport === 'sw') return false;
-  const offscreen = chrome.offscreen;
-  if (!offscreen || !offscreen.createDocument) { transport = 'sw'; return false; }
   const url = chrome.runtime.getURL(OFFSCREEN_PATH);
   try {
     const ctxs = await chrome.runtime.getContexts({
@@ -250,7 +271,7 @@ async function ensureOffscreen() {
     if (ctxs && ctxs.length) return true;
   } catch { /* getContexts 不可用：直接尝试创建，重复创建会抛错并被吞掉 */ }
   if (creatingOffscreen) { await creatingOffscreen; return true; }
-  creatingOffscreen = offscreen.createDocument({
+  creatingOffscreen = chrome.offscreen.createDocument({
     url: OFFSCREEN_PATH,
     // 该 reason 不设时长上限（只有 AUDIO_PLAYBACK 会 30s 静默关闭）
     reasons: ['WORKERS'],
@@ -261,50 +282,8 @@ async function ensureOffscreen() {
   return true;
 }
 
-/** SW 内直连（退回模式）：仅当 offscreen 不可用时使用 */
-function connectInSW() {
-  swWs = new WebSocket(WS_URL);
-  swWs.onopen = async () => {
-    swBackoff = 1000;
-    const t = await getToken();
-    const hello = { type: 'hello', role: 'ext' };
-    if (t) hello.token = t;
-    swWs.send(JSON.stringify(hello));
-  };
-  swWs.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === 'hello-ok') {
-      bridgeState = { connected: true, error: null, at: Date.now() };
-      if (msg.token) saveToken(msg.token);
-      return;
-    }
-    if (msg.type === 'hello-fail') {
-      bridgeState = { connected: false, error: msg.error || '握手被拒绝', at: Date.now() };
-      console.log(`[webagents] 桥握手被拒绝：${msg.error}`);
-      return;
-    }
-    if (msg.type === 'request') {
-      handleRequest(msg).catch((err) => sendResult(msg.id, { ok: false, error: err.message }));
-    }
-  };
-  swWs.onclose = () => {
-    bridgeState = { connected: false, error: '连接已断开', at: Date.now() };
-    setTimeout(connectInSW, swBackoff);
-    swBackoff = Math.min(swBackoff * 2, 30000);
-  };
-  swWs.onerror = () => { try { swWs.close(); } catch {} };
-}
-
 /** 把一条消息发往桥。offscreen 不可达时重建一次再试（offscreen 可能刚被回收）。 */
 async function postToBridge(payload) {
-  if (transport === 'sw') {
-    if (swWs && swWs.readyState === 1) {
-      try { swWs.send(JSON.stringify(payload)); return true; } catch { /* 落到底部重连 */ }
-    }
-    connectInSW();
-    return false;
-  }
   // 新建的 offscreen 文档需要一点时间注册 onMessage：给几次短重试，避免"结果丢失"
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -323,30 +302,19 @@ function sendResult(id, payload) {
   return postToBridge({ type: 'result', id, ...payload });
 }
 
-// 反向兜底：若 offscreen 始终建不起来，退回 SW 直连，功能不缺席。
+// 启动时确保 offscreen 文档在。
 //
-// 注意**不要在这里推送令牌**：这段代码每次 SW 启动都会执行，而 SW 每分钟都会被
+// 注意**不要在这里推送令牌**：这段每次 SW 启动都会执行，而 SW 每分钟都会被
 // 看门狗 alarm 唤醒一次 —— 一旦推送令牌就触发 offscreen 侧"断开重连"，
 // 结果连接被自己掐断、每分钟闪断一次（实测过：日志里精确 60s 一断一续）。
-// 令牌由 offscreen 在需要连接时主动来取（op:'get-token'），这里只确保它存在。
-ensureOffscreen().then(async (ok) => {
-  if (ok) {
-    console.log('[webagents] 连接由 offscreen 文档承载');
-    return;
-  }
-  console.log('[webagents] offscreen 不可用，退回 SW 内直连');
-  connectInSW();
-});
+// 令牌由 offscreen 在需要连接时主动来取（op:'get-token'）。
+ensureOffscreen();
 
 // 看门狗：offscreen 文档理论上不会自己消失，但万一消失（浏览器回收等），
 // 只有 SW 能重建它。一分钟一次，代价可忽略。
 chrome.alarms.create('bridge-watchdog', { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== 'bridge-watchdog') return;
-  if (transport === 'sw') {
-    if (!swWs || swWs.readyState > 1) connectInSW();
-    return;
-  }
   try {
     const url = chrome.runtime.getURL(OFFSCREEN_PATH);
     const ctxs = await chrome.runtime.getContexts({
@@ -365,58 +333,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
   } catch { /* 检测失败不处理，等下一轮 */ }
 });
-
-// ---- CDP 可信输入（chrome.debugger）：备用通道，当前无调用方 ----
-//
-// 现状如实说明：**没有 content script 在使用它**。千问的输入走的是
-// 「显式选区 + execCommand insertText」（见 content/qwen.js），并未依赖 CDP。
-// 保留此函数的理由是：当合成事件路径被站点封掉时，这是唯一还能用的降级手段。
-// 正因为它当前无人调用，才更应该改为按需授权 —— 不该为一个没接线的能力常驻
-// 显示"正在调试此浏览器"。
-const dbgAttached = new Set();
-// 保持附加状态准确：外部（如 DevTools 打开）会导致 detach，之后需要重新附加
-try {
-  chrome.debugger.onDetach.addListener((source) => {
-    if (source && source.tabId != null) dbgAttached.delete(source.tabId);
-  });
-} catch { /* 无 debugger 权限时部分环境可能不提供该事件 */ }
-
-/**
- * 调试权限已改为**按需申请**（manifest 的 optional_permissions）。
- *
- * 为什么：`debugger` 是权限清单里最重的一项 —— 装上就常驻显示"正在调试此浏览器"，
- * 而它只服务于千问一个站点。改成按需后，不跑千问的用户不该承担这个代价。
- *
- * 代价是它无法在后台静默授予：`chrome.permissions.request()` 属于"需要用户手势"的 API，
- * 只能在设置页由用户点击触发。所以这里必须给出**可操作的**报错，而不是静默失败。
- */
-async function hasDebuggerPermission() {
-  try {
-    if (!chrome.permissions || !chrome.permissions.contains) return true; // 老环境按已授权处理
-    return await chrome.permissions.contains({ permissions: ['debugger'] });
-  } catch { return false; }
-}
-
-async function cdpClick(tabId, x, y) {
-  if (!(await hasDebuggerPermission())) {
-    throw new Error('缺少「调试」权限：这是备用输入通道，需在扩展设置页点击「授予调试权限」（当前两个站点都不依赖它）');
-  }
-  const target = { tabId };
-  const attachedHere = !dbgAttached.has(tabId);
-  if (attachedHere) await chrome.debugger.attach(target, '1.3');
-  try {
-    const base = { x, y, button: 'left', clickCount: 1, pointerType: 'mouse' };
-    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' });
-    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' });
-    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' });
-  } finally {
-    // 用完立即断开，尽量缩短「正在调试」状态暴露时间，降低风控弹窗概率
-    if (attachedHere) {
-      try { await chrome.debugger.detach(target); } catch {}
-      dbgAttached.delete(tabId);
-    }
-  }
-}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // ---- offscreen 文档的指令 ----
@@ -445,13 +361,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
   }
 
-  // content script 请求在页面坐标 (x,y) 处执行一次真实点击
-  if (msg && msg.type === 'cdpClick' && sender.tab && sender.tab.id != null) {
-    cdpClick(sender.tab.id, msg.x, msg.y)
-      .then(() => sendResponse({ ok: true }))
-      .catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true; // 异步 sendResponse
-  }
+  // 只接受两类目标消息（offscreen 的 op:* 与站点适配器内部消息）。
+  // 曾有第三条 cdpClick 分支（页面坐标代点），但两个站点从未调用过它，
+  // 整套 chrome.debugger 通道已随其一并移除 —— 需要时从 git 历史里取，别为一个空挂的能力
+  // 让权限清单上常驻「正在调试此浏览器」。
   return false;
 });
 
@@ -492,7 +405,7 @@ async function ensureTab(site) {
   for (let i = 0; i < 60; i++) {
     let r = null;
     try {
-      r = await chrome.tabs.sendMessage(tab.id, { type: 'ping' });
+      r = await tabsCall(tab.id, { type: 'ping' });
     } catch (err) { lastErr = err.message; }
     if (r && r.ready) {
       // 归位校验（2026-09-14 修复竞态）：必须精确在首页——旧对话页 URL 同样以站点域名开头，
@@ -502,7 +415,7 @@ async function ensureTab(site) {
       const path = String((cur && cur.url) || '').split('?')[0].split('#')[0];
       const onHome = path === cfg.url;
       let st = null;
-      try { st = await chrome.tabs.sendMessage(tab.id, { type: 'state' }); } catch {}
+      try { st = await tabsCall(tab.id, { type: 'state' }); } catch {}
       const stale = st && st.ok && st.count > 0;
       if ((!onHome || stale) && reloads < 3) {
         reloads++;
@@ -530,7 +443,9 @@ async function ensureTab(site) {
       try {
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          files: ['content/common.js', `content/${site}.js`],
+          // 与 manifest 的注入清单保持一致：dom-md 必须一起灌，否则 answerState 拿不到
+          // window.__WEBAGENTS_DOMMD__，正文只能退回 innerText（表格与代码结构全丢）
+          files: ['content/dom-md.js', 'content/common.js', `content/${site}.js`],
         });
       } catch (err) {
         lastErr = `补注入失败: ${err.message}`;
@@ -579,9 +494,9 @@ async function ensureContinueTab(site) {
         let r = null;
         let cur = null;
         let st = null;
-        try { r = await chrome.tabs.sendMessage(tab.id, { type: 'ping' }); } catch (err) { lastErr = err.message; info.pingErr = String(err.message).slice(0, 60); }
+        try { r = await tabsCall(tab.id, { type: 'ping' }); } catch (err) { lastErr = err.message; info.pingErr = String(err.message).slice(0, 60); }
         try { cur = await chrome.tabs.get(tab.id); } catch { /* 忽略 */ }
-        try { st = await chrome.tabs.sendMessage(tab.id, { type: 'state' }); } catch (err2) { info.stateErr = String(err2.message).slice(0, 60); }
+        try { st = await tabsCall(tab.id, { type: 'state' }); } catch (err2) { info.stateErr = String(err2.message).slice(0, 60); }
         const path = String((cur && cur.url) || '').split('?')[0].split('#')[0];
         const onChatPage = !!cur && path !== cfg.url;   // 不在首页 = 在某个会话页里
         const hasReplies = !!(st && st.ok && st.count > 0);
@@ -607,7 +522,7 @@ async function ensureContinueTab(site) {
         try {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
-            files: ['content/common.js', `content/${site}.js`],
+            files: ['content/dom-md.js', 'content/common.js', `content/${site}.js`],
           });
         } catch (err) { lastErr = `补注入失败: ${err.message}`; }
       }
@@ -631,19 +546,13 @@ async function handleRequest(msg) {
     // 向连接的实际持有者**现查**状态，而不是读 SW 里的缓存：
     // SW 会被回收，缓存状态在重启后是空的，读缓存会误报"未连接"。
     let connected = false;
-    let transportDesc = '';
-    if (transport === 'sw') {
-      connected = !!(swWs && swWs.readyState === 1);
-      transportDesc = 'Service Worker 直连（退回模式）';
-    } else {
-      transportDesc = 'offscreen 常驻文档';
-      try {
-        const st = await chrome.runtime.sendMessage({ target: 'offscreen', op: 'state' });
-        connected = !!(st && st.connected);
-      } catch {
-        connected = bridgeState.connected;
-        transportDesc += '（查询失败，按最近上报）';
-      }
+    let transportDesc = 'offscreen 常驻文档';
+    try {
+      const st = await chrome.runtime.sendMessage({ target: 'offscreen', op: 'state' });
+      connected = !!(st && st.connected);
+    } catch {
+      connected = bridgeState.connected;
+      transportDesc += '（查询失败，按最近上报）';
     }
     return sendResult(id, stamp({
       ok: true,
@@ -675,6 +584,11 @@ async function handleRequest(msg) {
 async function handleSiteRequest(msg, id, site, stamp, stampBase) {
   const { action } = msg;
   try {
+    // 先验 action 再动标签页：probe 移除后这里只剩 ask / inspect，
+    // 拼错的动作不该先把站点标签页创建/导航出来才报错。
+    if (action !== 'ask' && action !== 'inspect') {
+      return sendResult(id, stamp({ ok: false, error: `未知 action: ${action}（可用：ask / inspect）` }));
+    }
     // ---- 只读查看：**绝不导航** ----
     // 与 probe 的关键区别：probe 会先 ensureTab 归位首页 = 整页重载，
     // 而整页重载会摧毁正在展示的风控验证状态、也会清空探针的流记录。
@@ -689,19 +603,32 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
       }
       let probeData = null;
       let stateData = null;
+      // 两跳失败的原因必须带出去（2026-09-21）。以前一律空 catch 吞掉，inspect 照样 ok:true，
+      // 而 doctor 只看 data.url 就打个 ✓ —— 那个 url 是 SW 自己 tabs.query 来的、永远有值。
+      // 于是"刚重载过扩展 / 页面停在登录页"这类**适配器一个字都没回**的状态，
+      // 在排障第一入口上显示成健康（实测两个站点同时全 null 却报 ✓✓）。
+      let probeError = null;
+      let stateError = null;
       // probe 消息偶尔会赶在内容脚本就绪前发出（跳转后水合期），重试一次；
       // state 是取证的核心（挑战/回复区/流），必须拿到，失败也重试。
       for (let attempt = 0; attempt < 2 && (!probeData || !stateData); attempt++) {
         if (attempt) await sleep(500);
-        try { probeData = probeData || await chrome.tabs.sendMessage(tab.id, { type: 'probe' }); } catch { /* 忽略 */ }
-        try { stateData = stateData || await chrome.tabs.sendMessage(tab.id, { type: 'state' }); } catch { /* 忽略 */ }
+        // probe 是全页 DOM 扫描（最重的一次往返），给到 20s；超时不再是挂死，而是带原因报出来
+        try { probeData = probeData || await tabsCall(tab.id, { type: 'probe' }, 20000); }
+        catch (err) { probeError = err.message; }
+        try { stateData = stateData || await tabsCall(tab.id, { type: 'state' }); }
+        catch (err2) { stateError = err2.message; }
       }
+      const adapterReady = !!(probeData || stateData);
       return sendResult(id, stamp({
         ok: true,
         data: {
           tabId: tab.id,
           url: tab.url,
           active: tab.active,
+          // 适配器（内容脚本）是否真的应答了 —— doctor / CLI 判健康要看这个，不是看 url
+          adapterReady,
+          adapterError: adapterReady ? null : (stateError || probeError || '内容脚本无响应'),
           challenge: (stateData && stateData.challenge) || null,
           stream: (stateData && stateData.stream) || null,
           probeWorld: (stateData && stateData.streamProbe) || null,
@@ -737,10 +664,9 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
       tabId = await ensureTab(site);
     }
 
-    if (action === 'probe') {
-      const r = await chrome.tabs.sendMessage(tabId, { type: 'probe' });
-      return sendResult(id, stamp(r || { ok: false, error: 'content script 无响应' }));
-    }
+    // 曾有的 `action === 'probe'` 已随 MCP 工具面一起移除（0.7.0）：它会先 ensureTab 归位首页
+    // = 整页重载，从而摧毁风控验证现场与流记录，历史用量只有 1 次；
+    // 同一份 DOM 探测结果本来就在 inspect 的 data.probe 里，且不导航。
 
     if (action === 'ask') {
       // 合并用户默认开关（扩展选项页设置）：面板设置优先级最高，覆盖显式 options；null/未设置 = 不干预页面开关
@@ -791,7 +717,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
       let base = null;
       if (cont) {
         try {
-          const b = await chrome.tabs.sendMessage(tabId, { type: 'state', since: askSince });
+          const b = await tabsCall(tabId, { type: 'state', since: askSince });
           if (b && b.ok) base = { count: b.count || 0, text: b.text || '' };
         } catch { /* 基线拿不到时按宽松模式（见 hasSignal） */ }
         stampBase.continued = true;
@@ -800,11 +726,11 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
       // ack 兜底 60s：content 最坏合法路径（长文本逐字符注入×2 次 + 选项切换）可能 ~50s，
       // 超时按 ack 丢失处理，绝不无限挂起等 sendMessage。
       const ack = await Promise.race([
-        chrome.tabs.sendMessage(tabId, { type: 'ask', prompt: msg.prompt, options: effOptions }).catch(() => null),
+        tabsCall(tabId, { type: 'ask', prompt: msg.prompt, options: effOptions }, 60000).catch(() => null),
         sleep(60000).then(() => null),
       ]);
 
-      // ack 显式失败 = content 校验已确认失败 → 立即把错误传回 server/MCP，绝不静默重试
+      // ack 显式失败 = content 校验已确认失败 → 立即把错误传回桥/CLI，绝不静默重试
       if (ack && ack.ok === false) {
         const stage = ack.stage || 'unknown';
         const detail = ack.detail || ack.error || '未知错误';
@@ -873,7 +799,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
         let st0 = null;
         while (Date.now() < ackDeadline) {
           await sleep(600);
-          try { st0 = await chrome.tabs.sendMessage(tabId, { type: 'state', since: askSince }); } catch { continue; }
+          try { st0 = await tabsCall(tabId, { type: 'state', since: askSince }); } catch { continue; }
           if (st0 && (((st0.count > 0 && st0.text) || st0.feedback) || looksLikeAsk(readStream(st0)))) break;
         }
         if (!(st0 && (((st0.count > 0 && st0.text) || st0.feedback) || looksLikeAsk(readStream(st0))))) {
@@ -914,7 +840,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
        */
       const collectDiag = async () => {
         try {
-          const dg = await chrome.tabs.sendMessage(tabId, { type: 'streamDiag', since: askSince, timeoutMs: 1200 });
+          const dg = await tabsCall(tabId, { type: 'streamDiag', since: askSince, timeoutMs: 1200 });
           if (!dg || !dg.ok) return null;
           return {
             probeWorld: dg.probeWorld,
@@ -929,9 +855,17 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
             events: dg.data && dg.data.events,
             frames: dg.data && dg.data.frames,
             rawTexts: dg.data && dg.data.rawTexts,
+            // 片段清单（类型+长度+开头）：判断"正文有没有归对片段"的直接证据
+            frags: dg.data && dg.data.frags,
+            answerStart: dg.data && dg.data.answerStart,
+            deltaByKind: dg.data && dg.data.deltaByKind,
+            pendingByKind: dg.data && dg.data.pendingByKind,
+            contentOps: dg.data && dg.data.contentOps,
+            noOpContentWrites: dg.data && dg.data.noOpContentWrites,
             // 本页全部流的摘要：判断"作答流有没有被抓到"的决定性证据
             streams: dg.streams,
             sampleHead: dg.data && dg.data.sampleHead,
+            headFrames: dg.data && dg.data.headFrames,
             // 完成标记与生成指示器的当次状态：判断"门控是否生效"的直接证据
             complete: dg.complete,
             feedback: dg.feedback,
@@ -948,7 +882,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
         for (let attempt = 0; attempt < 3 && !md && s && s.id; attempt++) {
           if (attempt) await sleep(300);
           try {
-            const r = await chrome.tabs.sendMessage(tabId, {
+            const r = await tabsCall(tabId, {
               type: 'streamText', since: askSince, streamId: s.id, timeoutMs: 1500,
             });
             if (r && r.text) { md = r.text; mdVia = r.via || 'probe'; }
@@ -957,13 +891,50 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
         }
 
         let domText = '';
+        let domViaMd = false;
+        let domErr = null;
         let opts = null;
-        try {
-          const re = await chrome.tabs.sendMessage(tabId, { type: 'state', since: askSince });
-          if (re && re.ok) { domText = re.text || ''; opts = re.options ?? null; }
-        } catch { /* 忽略 */ }
+        // 页面正文要**重试着读**。实测：流刚关闭那一刻 domErr=null 而 domLen=0，
+        // 同一个选择器几秒后能读出完整正文 —— 站点还没把答案挂进 DOM。
+        // 一次读不到就放弃，等于主动丢掉唯一的交叉校验手段。
+        for (let attempt = 0; attempt < 3 && !domText; attempt++) {
+          if (attempt) await sleep(800);
+          try {
+            const re = await tabsCall(tabId, { type: 'state', since: askSince });
+            if (re && re.ok) {
+              domText = re.text || '';
+              domViaMd = !!re.viaMd;
+              opts = re.options ?? null;
+            } else {
+              domErr = 'state 未返回 ok';
+            }
+          } catch (err) {
+            // 必须留痕：domLen=0 有两种完全不同的成因 —— "页面上确实没有答案节点"
+            // 与"这一跳根本没成功"（超时/通道问题）。以前一律吞掉，无从分辨。
+            domErr = String((err && err.message) || err).slice(0, 120);
+          }
+        }
+        if (domText) domErr = null;
+        // 只在"可疑"时才为交叉校验多等：DOM 空着而流有正文，正是无法自证的组合。
+        // 实测站点把答案挂进 DOM 比流关闭晚好几秒（3 次 0.8s 重试仍读到 count=0，
+        // 而一分钟后 inspect 同一个选择器能读出完整正文）—— 正常路径不多花这一秒。
+        if (!domText && md) {
+          for (let wait = 0; wait < 3 && !domText; wait++) {
+            await sleep(1500);
+            try {
+              const re2 = await tabsCall(tabId, { type: 'state', since: askSince });
+              if (re2 && re2.ok && re2.text) {
+                domText = re2.text; domViaMd = !!re2.viaMd; domErr = null;
+              }
+            } catch (err2) { domErr = String((err2 && err2.message) || err2).slice(0, 120); }
+          }
+        }
 
-        const useMd = !!md && (!domText || md.length >= domText.length * 0.5);
+        // 两路都有正文时**以页面为准交叉校验**：DOM 是用户实际看到的终稿，
+        // 流还原比它短就是丢字（实测稳定丢开头 1~3 字）。
+        // 旧规则"流长度够 DOM 的一半就采信流"会把这种截断放过去。
+        const streamShort = !!md && !!domText && md.length < domText.length;
+        const useMd = !!md && !streamShort;
         const text = useMd ? md : (domText || md || '');
 
         const status = s.status || streamStatus || null;
@@ -991,21 +962,51 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
           options: opts,
           viaStream: true,
           streamStatus: status,
-          textSource: useMd ? 'stream' : 'dom',
+          textSource: useMd ? 'stream' : (domViaMd ? 'dom-md' : 'dom'),
           // 长度快照：正文异常时不用再猜"是取回失败还是 DOM 更长"
           mdLen: md.length,
           domLen: domText.length,
+          // domLen=0 时的归因：null=DOM 确实没有正文，有值=这一跳失败/超时
+          domErr,
           mdVia,
           streamId: (s && s.id) || null,
         };
         if (warn) { payload.truncated = true; payload.warning = warn; }
+        // 流还原比页面短：改用页面正文，并把差值如实报出来（丢字的量化证据）
+        if (streamShort) {
+          payload.streamShortBy = domText.length - md.length;
+          if (!payload.warning) {
+            payload.warning = `流还原比页面正文少 ${domText.length - md.length} 字，已改用页面正文（流解析疑似丢帧）`;
+          }
+        }
 
-        // 正文退回 DOM（还原未生效）时附带诊断，成功还原时不打扰
-        if (!useMd) {
-          const diag = await collectDiag();
-          if (diag) {
-            payload.diag = diag;
-            console.log(`[webagents] ${site} 正文退回 DOM，当次诊断: ${JSON.stringify(diag)}`);
+        // ---- 未经交叉校验的正文不许静默通过（2026-09-21）----
+        // 旧规则 `!!md && (!domText || md.length >= domText.length*0.5)` 在 DOM 一个字都没读到时
+        // 无条件采信流文本，于是被截断的正文会以 ok=true、无任何警告的形式返回
+        // —— 实测：页面显示完整的 7 字答案，我们只回了尾缀 4 字，status=FINISHED、退出码 0。
+        const unverified = useMd && !!md && !domText;
+        let diag = null;
+        // 正文退回 DOM（还原未生效）、或流正文没被 DOM 校验过时才采集诊断；两路对得上时不打扰
+        if (!useMd || unverified) diag = await collectDiag();
+
+        if (unverified) {
+          payload.textSource = 'stream-unverified';
+          // 说清"为什么没能校验"：实测站点把答案挂进 DOM 比流关闭晚好几秒，那种情况下正文
+          // 往往是完整的。笼统喊"可能不完整"会让警告变常驻噪音、真信号反而被盖掉。
+          payload.unverified = domErr ? 'dom_call_failed' : 'answer_not_mounted';
+          const oddFrames = diag && diag.noOpContentWrites;
+          if (!payload.warning) {
+            payload.warning = (domErr
+              ? `DOM 那一跳失败（${domErr}）`
+              : '页面此刻尚未把答案挂进 DOM（实测比流关闭晚数秒），选择器本身正常')
+              + '；本次正文仅来自流还原、未经交叉校验'
+              + (oddFrames ? `；本轮出现 ${oddFrames} 帧"写 content 但不带 o"的帧（解析按追加处理）` : '');
+          }
+        }
+        if (diag) {
+          payload.diag = diag;
+          if (!useMd || unverified) {
+            console.log(`[webagents] ${site} ${unverified ? '正文未经交叉校验' : '正文退回 DOM'}，当次诊断: ${JSON.stringify(diag)}`);
           }
         }
         return sendResult(id, stamp(payload));
@@ -1035,7 +1036,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
           let domOpts = null;
           let streamInfo = null;
           try {
-            const re = await chrome.tabs.sendMessage(tabId, { type: 'state', since: askSince });
+            const re = await tabsCall(tabId, { type: 'state', since: askSince });
             if (re && re.ok) {
               domText = re.text || '';
               domOpts = re.options ?? null;
@@ -1070,7 +1071,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
 
         let st = null;
         try {
-          st = await chrome.tabs.sendMessage(tabId, { type: 'state', since: askSince });
+          st = await tabsCall(tabId, { type: 'state', since: askSince });
         } catch {
           continue; // 页面跳转中（content script 重建），不计入首反馈窗口，下一轮再取
         }
@@ -1126,7 +1127,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
           if (siteErrorRetried >= SITE_RETRY_MAX) siteErrorStuck = true;
           if (!siteErrorStuck) {
             let clicked = null;
-            try { clicked = await chrome.tabs.sendMessage(tabId, { type: 'siteRetry' }); } catch { clicked = null; }
+            try { clicked = await tabsCall(tabId, { type: 'siteRetry' }); } catch { clicked = null; }
             siteErrorRetried += 1;
             if (clicked && clicked.clicked) {
               deadline += SITE_RETRY_GRACE_MS; // 重试后重新给生成预算
@@ -1285,7 +1286,7 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
           if (now - stableSince >= 400) {
             await sleep(300); // 复确认
             let re = null;
-            try { re = await chrome.tabs.sendMessage(tabId, { type: 'state', since: askSince }); } catch {}
+            try { re = await tabsCall(tabId, { type: 'state', since: askSince }); } catch {}
             if (re && re.ok && re.text === text) {
               // 兜底路径也把"站点自报终态"带出去，避免半截答案被静默当成功
               const sInfo = (re.streamProbe && re.streamProbe.world === 'main' && re.stream) ? re.stream : null;
@@ -1318,8 +1319,6 @@ async function handleSiteRequest(msg, id, site, stamp, stampBase) {
         }
       }
     }
-
-    return sendResult(id, stamp({ ok: false, error: `未知 action: ${action}` }));
   } catch (err) {
     sendResult(id, stamp({ ok: false, error: err.message }));
   } finally {

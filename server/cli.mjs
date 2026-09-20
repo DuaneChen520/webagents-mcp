@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
- * WEBAGENTS-cli — 命令行原语（v0.5.0 新增，skill 封装层的底座）
+ * WEBAGENTS-cli — 命令行原语（v0.5.0 新增，skill 封装层的唯一入口底座）
  *
- * 与 MCP server（index.mjs）共用同一个单例 bridge 与 runs.jsonl，是并列的两个入口：
- *   - MCP：IDE 会话内的结构化工具调用
+ * 与 bridge.mjs / store.mjs 一起构成全部服务端：CLI 连单例桥，桥驱动扩展。
  *   - CLI：skill/剧本/脚本/人，用后台进程、落盘文件、grep 组合出批量与并行派发
  *
  * 设计原则（PLAN-cli-skill.md 定稿）：
@@ -16,7 +15,7 @@
  *   4. --prompt-file / stdin：prompt 本身可能超 Windows argv 32767 字符上限。
  *   5. 桥宿主：先连现有桥；连不上以分离方式拉起（unref），桥随本命令结束后继续存活。
  *
- * 运行：node server/cli.mjs <ask|runs|inspect|status|help> ...
+ * 运行：node server/cli.mjs <ask|runs|inspect|status|doctor|bridge|help> ...
  */
 import { WebSocket } from 'ws';
 import { spawn } from 'node:child_process';
@@ -31,7 +30,7 @@ import { execSync, spawnSync } from 'node:child_process';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.WEBAGENTS_PORT || 8765);
 const TIMEOUT_MS = Number(process.env.WEBAGENTS_TIMEOUT || 300000);
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 const WS_URL = `ws://127.0.0.1:${PORT}`;
 const ATTACH_MAX_BYTES = 60 * 1024;
 const SITES = ['deepseek', 'qwen'];
@@ -40,8 +39,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (s, n = 200) => (typeof s === 'string' ? s.slice(0, n) : s);
 const currentToken = () => resolveToken({ create: false }).token || '';
 
-// ===================== 桥客户端（与 index.mjs 同协议；保持独立副本，
-// 使 MCP 路径不因 CLI 的演进而被波及） =====================
+// ===================== 桥客户端 =====================
+//
+// 请求 id 必须**全局唯一**，不能只在进程内唯一：桥按 id 索引在飞请求，
+// 而 skill 的 fanout 用法就是同时起多个 CLI 进程。09-21 实测复现：两个进程都用
+// "cli-1" 时，后注册者顶掉前者 —— 前者的结果被投给后者（答案张冠李戴），
+// 前者干等到自己的超时。这里给每个进程一个随机前缀。
+const CLIENT_NONCE = crypto.randomBytes(4).toString('hex');
 
 let ws = null;
 let seq = 0;
@@ -53,11 +57,26 @@ function tryConnect() {
     const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
     const sock = new WebSocket(WS_URL);
     const timer = setTimeout(() => { sock.terminate(); done(reject, new Error('connect timeout')); }, 2000);
-    sock.on('open', () => sock.send(JSON.stringify({ type: 'hello', role: 'mcp', token: currentToken() })));
+    // hb:1 = 声明「本进程会应答应用层心跳」，桥据此才对这条连接做半开检测
+    sock.on('open', () => sock.send(JSON.stringify({ type: 'hello', role: 'cli', hb: 1, token: currentToken() })));
     sock.on('message', (raw) => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
-      if (msg.type === 'hello-ok') { clearTimeout(timer); done(resolve, sock); }
+      if (msg.type === 'hb') {
+        try { sock.send(JSON.stringify({ type: 'hb-ack', t: msg.t })); } catch {}
+        return;
+      }
+      if (msg.type === 'hello-ok') {
+        clearTimeout(timer);
+        // 对端把我们当成扩展接入 = "旧桥 + 新 CLI"的组合（旧桥只认 role:'mcp'，其余一律当扩展），
+        // 继续用会顶掉真正的扩展连接、表现成"扩展莫名离线"。宁可当场拒绝并给出换桥命令。
+        if (msg.role && msg.role !== 'cli') {
+          try { sock.terminate(); } catch {}
+          return done(reject, new Error(`桥版本过旧（把 CLI 认成了 role=${msg.role}，会顶掉扩展连接）：`
+            + '先 `node server/cli.mjs bridge stop --force` 再 `bridge start`'));
+        }
+        return done(resolve, sock);
+      }
       else if (msg.type === 'hello-fail') {
         clearTimeout(timer);
         try { sock.terminate(); } catch {}
@@ -98,7 +117,7 @@ function request(action, payload = {}, timeoutMs = TIMEOUT_MS) {
   return new Promise(async (resolve, reject) => {
     try {
       if (!ws || ws.readyState !== 1) await ensureBridge();
-      const id = `cli-${++seq}`;
+      const id = `cli-${CLIENT_NONCE}-${++seq}`;
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new Error(`扩展执行超时（${Math.round(timeoutMs / 1000)}s）`));
@@ -137,7 +156,7 @@ async function ensureExtensionReady({ budgetMs = Number(process.env.WEBAGENTS_EX
 
 const HINTS = {
   input: '检查参数：prompt 非空；--attach 单文件 ≤60KB；站点为 deepseek|qwen',
-  connect: '先跑 `status`；不行则重启 IDE 的 MCP 会话（桥由它拉起）或确认 Edge 扩展已启用。如需桥跨命令常驻，可在你自己的终端里运行 node server/bridge.mjs',
+  connect: '先跑 `status`；再 `bridge start` 把桥驻留起来（外部残留的旧桥要 `bridge stop --force` 换掉）；仍不通则确认 Edge 扩展已启用。',
   queue: '同站点前序任务未结束（排队上限 4 分钟）；稍候重试',
   send: '发送未生效或页面被人为操作过；用 `inspect <site>` 看现场（不要用 probe，会整页重载毁掉现场）',
   challenge: '站点弹出人工验证；标签页已自动切前台，人手完成后会自动续跑',
@@ -145,15 +164,31 @@ const HINTS = {
   retrieve: '流里有正文但取回为空；通常重试即可；复现则 `runs --why last` 看当次诊断',
   quality: '站点报告了非正常终态；按 streamStatus 语义处理（INCOMPLETE=截断可续问 / CONTENT_FILTER=被过滤 / CONTEXT_LENGTH_EXCEEDED=上下文爆了 / TIMEOUT）',
   'session_gone': '无可续接的会话（标签页没开/在首页/无历史回复）；去掉 --continue 发首问，或把会话页重新打开',
+  // 以下都是**扩展侧直接吐出的 stage**，过去只列了七段、没覆盖它们，
+  // 于是 `hint=` 经常是空的 —— 而"失败必须可归因、必须给下一步"正是本仓库的自定原则。
+  inject: '注入未通过读回比对（页面可能是登录页/改版/编辑器未就绪）；`inspect <site>` 看 data.probe 的输入框候选',
+  options: '切换对话开关失败（站点开关结构改版）；先去掉 --think/--search 试一次，再用 inspect 校准 setOptions',
+  no_site_feedback: '发送后站点毫无反应：多半是页面停在登录页、或扩展重载后页面里的内容脚本已失效——**刷新该站点页**再试（ask 的补注入救不了这种情况）',
+  stream_empty: '响应流已关闭但一个字都没取到：看 `runs --why last` 的 diag（frames 计数能分辨是"没抓到流"还是"抓到但还原失败"）',
+  site_network_error: '站点自报网络异常且代点「重试」用尽：人手点一下页面上的「重试」即可续跑；若正文其实已渲染，用 --continue here 原样重发取回',
+  empty_body: '执行成功但正文为空：先 inspect 看页面，若正文已渲染则 --continue here 让其重发取回',
+  unknown: '内容脚本返回了未分级的失败：`runs --why last` 看 detail 原文',
+  adapter: '标签页在、但内容脚本没应答（刚重载过扩展 / 页面停在登录页 / 还没加载完）。刷新该站页面，或直接跑一次 ask（会程序化补注入）',
+  // 等待天花板用尽 ≠ 连不上：这一段是"扩展一个字都没回"，与桥/令牌无关，
+  // 别按 connect 的指引去重启会话（09-20 那 53 次就是这么被读错的）。
+  timeout: '扩展在预算内没有任何回音。第一步 `inspect <site>` 看它到底在不在干活；再看 `status` 有没有"半开"事件；并发跑多条命令时注意同站点会排队',
 };
 
 export function stageOf(r = {}) {
   if (r.stage) return r.stage;
   const err = r.error || '';
-  if (/扩展未连接|bridge|握手|令牌/i.test(err)) return 'connect';
   if (/排队/.test(err)) return 'queue';
   if (r.mdLen === 0 && r.streamId) return 'retrieve';
   if (r.streamStatus && r.streamStatus !== 'FINISHED' && r.streamStatus !== 'WIP') return 'quality';
+  // 「执行超时」放在具体证据之后：返回体里已经带出 mdLen/streamId/streamStatus 时，
+  // 那些比"对面没回话"更有指向性（09-21 加此段时先判超时，把 retrieve 用例顶掉了）。
+  if (/执行超时/.test(err)) return 'timeout';
+  if (/扩展未连接|bridge|握手|令牌/i.test(err)) return 'connect';
   return 'generate';
 }
 
@@ -192,6 +227,46 @@ export function parseArgs(argv = []) {
 }
 
 function usageErr(msg) { const e = new Error(msg); e.code = 'usage'; return e; }
+
+/**
+ * 按调用指定对话开关（0.7.0 补）。
+ *
+ * 这条能力原本只在已删除的 MCP 入口上有（`options: args.options`），CLI 化时漏搬 ——
+ * 结果 options 被硬编码成 null，唯一的入口是 popup 的 userDefaults，
+ * 于是"同一站点不同任务用不同开关"做不到，深度思考变成**页面残留状态说了算**、不可复现。
+ *
+ * 注意优先级：扩展设置页的强制默认值**高于**这里的显式参数（面板 wins，见 background.js
+ * 的 userDefaults 合并）。真被面板覆盖时会回读生效状态并告警，不静默吞。
+ */
+const OPT_ONOFF = { on: true, off: false, 'true': true, 'false': false, yes: true, no: false };
+const QWEN_MODES = ['fast', 'think', 'research'];
+
+export function buildOptions(site, flags = {}) {
+  const opts = {};
+  const onOff = (flagName, key) => {
+    const raw = flags[flagName];
+    if (raw === undefined) return;
+    if (!(String(raw).toLowerCase() in OPT_ONOFF)) {
+      throw usageErr(`${flagName} 只接受 on|off，收到 ${raw}`);
+    }
+    opts[key] = OPT_ONOFF[String(raw).toLowerCase()];
+  };
+  if (site === 'deepseek') {
+    onOff('--think', 'deepThink');
+    onOff('--search', 'search');
+    if (flags['--mode']) throw usageErr('--mode 只适用于 qwen；deepseek 用 --think/--search');
+  } else if (site === 'qwen') {
+    const m = flags['--mode'];
+    if (m !== undefined) {
+      if (!QWEN_MODES.includes(m)) throw usageErr(`--mode 只接受 ${QWEN_MODES.join('|')}，收到 ${m}`);
+      opts.mode = m;
+    }
+    if (flags['--think'] !== undefined || flags['--search'] !== undefined) {
+      throw usageErr('--think/--search 只适用于 deepseek；qwen 用 --mode');
+    }
+  }
+  return Object.keys(opts).length ? opts : null;
+}
 
 /**
  * 组装最终 prompt：prompt-file（或 stdin）+ 附件。
@@ -261,6 +336,7 @@ export function summarize(r, { ms, outFile }) {
   if (r.textSource) bits.push(`正文=${r.textSource}`);
   if (r.mdLen !== undefined || r.domLen !== undefined) bits.push(`md=${r.mdLen ?? '-'}/${r.domLen ?? '-'}`);
   if (r.streamStatus) bits.push(`status=${r.streamStatus}`);
+  if (r.unverified) bits.push('⚠正文未交叉校验');
   if (r.queuedMs >= 500) bits.push(`排队${(r.queuedMs / 1000).toFixed(1)}s`);
   if (r.throttleWaitMs >= 500) bits.push(`节流${(r.throttleWaitMs / 1000).toFixed(1)}s`);
   bits.push(`-> ${outFile}`);
@@ -278,6 +354,7 @@ export function formatRuns(entries) {
     if (e.textSource) bits.push(`正文=${e.textSource}`);
     if (e.mdLen !== undefined || e.domLen !== undefined) bits.push(`md=${e.mdLen ?? '-'}/dom=${e.domLen ?? '-'}`);
     if (e.streamStatus) bits.push(`status=${e.streamStatus}`);
+    if (e.unverified) bits.push('正文未交叉校验');
     if (e.stage) bits.push(`阶段=${e.stage}`);
     if (e.runId) bits.push(`runId=${e.runId}`);
     if (e.error) bits.push(`错误=${short(e.error, 120)}`);
@@ -309,6 +386,8 @@ const USAGE = `WEBAGENTS CLI v${VERSION}
   node server/cli.mjs ask <deepseek|qwen> "prompt" [--out <file>] [--attach <file>]...
                     [--prompt-file <file>|-] [--json] [--why]
                     [--continue <runId>|last|here] [--protocol <file>] [--schema <file>]
+                    [--think on|off] [--search on|off]      # deepseek：深度思考 / 联网搜索
+                    [--mode fast|think|research]            # qwen：对话模式
   node server/cli.mjs runs [--limit n] [--site <s>] [--errors] [--dedupe] [--why <runId>|last]
   node server/cli.mjs inspect <deepseek|qwen>
   node server/cli.mjs status
@@ -343,30 +422,40 @@ async function cmdAsk({ pos, flags }) {
   if (!SITES.includes(site)) throw usageErr(`ask 的站点必须是 ${SITES.join(' | ')}，收到: ${site || '(空)'}`);
   const prompt = pos.slice(1).join(' ');
   const cont = resolveContinue(flags, site);
+  const askOpts = buildOptions(site, flags);
   const runId = `r${Date.now().toString(36)}`;
   const t0 = Date.now();
   const entry = { kind: 'tool', tool: 'cli.ask', site, runId };
   try {
-    // 无桥环境（MCP 关闭）下每条命令都会自拉桥；扩展重连有退避延迟，先等它就绪
+    // 无桥环境下每条命令都会自拉桥；扩展重连有退避延迟，先等它就绪
     const pre = await ensureExtensionReady();
     if (!pre.ok) throw new Error(pre.error || '扩展未连接');
     let askText = buildPrompt({ prompt, attach: flags.attach, promptFile: flags['--prompt-file'] });
-    if (flags['--protocol']) {
-      let tpl;
-      try { tpl = fs.readFileSync(flags['--protocol'], 'utf8'); } catch (e) { throw usageErr(`--protocol 文件读取失败: ${e.message}`); }
-      if (tpl.trim()) askText += `\n\n===== 输出协议（严格遵守）=====\n${tpl}`;
-    }
     let schema = null;
     if (flags['--schema']) {
       try { schema = JSON.parse(fs.readFileSync(flags['--schema'], 'utf8')); } catch (e) { throw usageErr(`--schema 文件不是合法 JSON: ${e.message}`); }
     }
+    // 给了 --schema 却没给 --protocol 时，自动带上仓库自带的协议模板：
+    // 只声明校验规则而不告诉模型"输出形态"，等于让它猜 —— 此前模板文件也从未落地。
+    const protocolPath = flags['--protocol']
+      || (schema ? path.join(__dirname, '..', 'skills', 'webagents', 'references', 'protocol.md') : null);
+    if (protocolPath) {
+      let tpl = null;
+      try { tpl = fs.readFileSync(protocolPath, 'utf8'); }
+      catch (e) {
+        if (!flags['--protocol']) {
+          console.error(`提示：未找到默认协议模板（${e.message}），本次只校验不注入形态`);
+        } else throw usageErr(`--protocol 文件读取失败: ${e.message}`);
+      }
+      if (tpl && tpl.trim()) askText += `\n\n===== 输出协议（严格遵守）=====\n${tpl}`;
+    }
     entry.promptHead = short(askText, 60);
     entry.promptHash = promptHash(askText);
     const doAsk = async (t, asContinue) => {
-      // 千问生成依赖页面可见性，SW 预算 420s；服务端等待要比它长（与 MCP 侧一致）
+      // 千问生成依赖页面可见性，SW 预算 420s；这里的等待要比它长
       const askTimeout = site === 'qwen' ? 420000 : undefined;
       return request('ask', {
-        site, prompt: t, options: null, timeoutMs: askTimeout,
+        site, prompt: t, options: askOpts, timeoutMs: askTimeout,
         ...(asContinue ? { continue: true } : {}),
       }, askTimeout ? askTimeout + 60000 : undefined);
     };
@@ -391,11 +480,25 @@ async function cmdAsk({ pos, flags }) {
       ok: !!r.ok, ms: Date.now() - t0,
       queuedMs: r.queuedMs, throttleWaitMs: r.throttleWaitMs,
       textSource: r.textSource, mdVia: r.mdVia, mdLen: r.mdLen, domLen: r.domLen,
+      domErr: r.domErr || undefined,
       streamStatus: r.streamStatus, streamId: r.streamId,
       challenge: r.challenge ? short(JSON.stringify(r.challenge), 200) : undefined,
       adaptiveSec: r.adaptiveSec, surfaced: r.surfaced || undefined,
       continued: cont || undefined, repaired: repaired || undefined,
+      // DOM 侧没读到正文、流结果无交叉校验（可能不完整）—— 必须进记录，
+      // 否则排障时看到 md=4 也不知道这个 4 是"答案就 4 字"还是"被截了"
+      unverified: r.unverified || undefined,
+      streamShortBy: r.streamShortBy || undefined,
+      askOptions: askOpts ? short(JSON.stringify(askOpts), 120) : undefined,
     });
+    // 面板的强制默认值优先级高于调用参数（设计如此），真被覆盖时必须说出来 ——
+    // 否则 "--think off" 看着生效了、实际跑的却是开思考的会话。
+    if (askOpts && r.options && typeof r.options === 'object') {
+      const drift = Object.entries(askOpts)
+        .filter(([k, v]) => r.options[k] !== undefined && r.options[k] !== v)
+        .map(([k, v]) => `${k}: 请求 ${v} → 实际 ${r.options[k]}`);
+      if (drift.length) console.error(`警告：开关被扩展设置页的强制默认值覆盖 —— ${drift.join('；')}`);
+    }
     if (!r.ok) {
       entry.stage = schemaFail ? 'quality' : stageOf(r);
       entry.error = short(schemaFail || r.error, 300);
@@ -431,9 +534,12 @@ async function cmdAsk({ pos, flags }) {
     if (err && err.code === 'usage') throw err;
     entry.ok = false;
     entry.ms = Date.now() - t0;
-    entry.stage = 'connect'; // 走到这里的异常只可能来自桥连接（ensureBridge/request 的连接层）
+    // 到这里只剩两种：连不上桥，或桥/扩展一个字都没回（等待天花板用尽）。
+    // 后者绝不能记成 connect —— 09-20 有 53 条被误标成 connect，把人指向"重启会话"，
+    // 而真正的原因是并发 CLI 进程请求 id 撞车 + 半开，两条都跟连接建立无关。
+    entry.stage = /执行超时/.test(err.message) ? 'timeout' : 'connect';
     entry.error = short(err.message, 300);
-    console.log(failLine({ stage: 'connect', reason: err.message, runId }));
+    console.log(failLine({ stage: entry.stage, reason: err.message, runId }));
     if (flags['--why']) console.error(JSON.stringify({ runId, error: err.message }, null, 2));
     process.exitCode = 1;
   } finally {
@@ -487,6 +593,25 @@ async function cmdInspect({ pos }) {
     return;
   }
   console.log(JSON.stringify(r.data, null, 2));
+  const adapter = adapterState(r.data);
+  if (!adapter.ready) {
+    console.log(failLine({ stage: 'adapter', reason: adapter.error }));
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * 适配器（页面里的内容脚本）是否真的应答了。
+ * 「标签页存在」不是健康证据：url 由扩展侧 tabs.query 得到，页面里没人应答时它照样有值。
+ * 扩展 0.4.4+ 自报 adapterReady/adapterError；更早的版本只能按"有没有拿到取证块"推断。
+ */
+function adapterState(data) {
+  if (!data) return { ready: false, error: 'inspect 无返回数据' };
+  if (typeof data.adapterReady === 'boolean') {
+    return { ready: data.adapterReady, error: data.adapterError || '内容脚本无响应' };
+  }
+  const ready = !!(data.answer || data.probe);
+  return { ready, error: ready ? null : '内容脚本无响应（应答原因需扩展 0.4.4+）' };
 }
 
 async function cmdStatus() {
@@ -511,7 +636,7 @@ async function cmdStatus() {
  *   AI 命令的 job object 之外）驻留桥 —— 这是沙箱内唯一合法的进程驻留通道
  *   （WMI / explorer 逃逸被安全策略拦截，job 会回收 detached 子进程，均 2026-09-15 实证）。
  *   pid 记入 bridge-keep.json 作为归属凭证。
- * stop：只杀**自己驻留的桥**（按记录）；无记录的外部桥（MCP 会话/用户终端/其它）需 --force。
+ * stop：只杀**自己驻留的桥**（按记录）；无记录的外部桥（用户终端/残留进程）需 --force。
  */
 const BRIDGE_TASK = 'WEBAGENTS-Bridge';
 const bridgeKeepFile = () => path.join(appDir(), 'bridge-keep.json');
@@ -566,13 +691,13 @@ function spawnDetachedBridge() {
   child.unref();
   return child;
 }
-/** bridge 归属：驻留（按记录）/ 外部管理（MCP 会话、用户终端等）/ 未运行 */
+/** bridge 归属：驻留（按记录）/ 外部管理（用户终端、残留进程等）/ 未运行 */
 function describeBridge() {
   const pid = findBridgePid();
   if (!pid) return { running: false, owner: '未运行' };
   const keep = readKeep();
   if (keep && String(keep.pid) === String(pid)) return { running: true, owner: '驻留（计划任务 ' + BRIDGE_TASK + '）', pid };
-  return { running: true, owner: '外部管理（MCP 会话 / 用户终端 / 其它）', pid };
+  return { running: true, owner: '外部管理（你的终端 / 残留进程；需要它换成本命令驻留的新版时用 bridge stop --force）', pid };
 }
 
 async function cmdBridge({ pos, flags }) {
@@ -654,7 +779,7 @@ async function cmdBridge({ pos, flags }) {
       return;
     }
     if (!keep && !flags['--force']) {
-      console.log(`当前桥（pid=${pid}）不是本命令驻留的（可能由 MCP 会话 / 你的终端 / 其它程序拉起）。`);
+      console.log(`当前桥（pid=${pid}）不是本命令驻留的（可能由你的终端 / 残留的旧进程拉起）。`);
       console.log('如确认要关闭它：`bridge stop --force`；否则无需操作。');
       return;
     }
@@ -716,10 +841,15 @@ async function cmdDoctor() {
   } catch (e) { lines.push(`✗ 扩展: ${e.message}`); coreOk = false; }
 
   // ⑤ 站点标签页（inspect 不创建不导航，纯只读）
+  // 判据是"适配器有没有应答"，不是"标签页在不在"（见 adapterState）
   for (const site of SITES) {
     try {
       const r = await request('inspect', { site }, 15_000);
-      lines.push(r.ok ? `✓ ${site}: 会话页 ${((r.data && r.data.url) || '').slice(0, 60)}` : `⚠ ${site}: ${(r.error || '').slice(0, 80)}`);
+      const url = ((r.data && r.data.url) || '').slice(0, 60);
+      const adapter = adapterState(r.data);
+      if (!r.ok) lines.push(`⚠ ${site}: ${(r.error || '').slice(0, 80)}`);
+      else if (!adapter.ready) lines.push(`⚠ ${site}: 标签页在（${url}）但 ${adapter.error} → 刷新该页或跑一次 ask 补注入`);
+      else lines.push(`✓ ${site}: 会话页 ${url}（适配器已应答）`);
     } catch (e) { lines.push(`⚠ ${site}: 查看失败 ${e.message}`); }
   }
 

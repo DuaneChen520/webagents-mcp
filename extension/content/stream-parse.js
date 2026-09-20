@@ -94,6 +94,23 @@
       if (typeof cur === 'string' && typeof v === 'string') write(cur + v);
       else if (Array.isArray(cur)) write(cur.concat(Array.isArray(v) ? v : [v]));
       else write(v);
+    } else if (!o) {
+      /**
+       * **缺 `o` 的帧是追加，不是覆盖**（2026-09-21 实抓定性，此前连猜错三次）。
+       * 站点会发只带 {p, v} 的帧：
+       *   at63 {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"K"}]}
+       *   at64 {"p":"response/fragments/-1/content","v":"IL"}
+       * 旧代码 `if (APPEND) … else write(v)` 把"没有 o"落到 else，等于 SET，
+       * 于是刚内联下发的首字符被整段替换 —— 表现为答案**稳定丢开头 N 字**，
+       * N 恒等于创建帧内联 content 的长度（五连实测：X / MK / BRA / HEAD / G / K）。
+       * 两种写法都兼容：整段重发（累积式）仍是替换，否则追加。
+       */
+      const cur = read();
+      if (typeof cur === 'string' && typeof v === 'string') {
+        if (v.length > cur.length && v.startsWith(cur)) write(v);
+        else write(cur + v);
+      } else if (Array.isArray(cur) && Array.isArray(v)) write(cur.concat(v));
+      else write(v);
     } else {
       write(v);
     }
@@ -126,7 +143,26 @@
     return target;
   }
 
-  /** 带 id 的对象数组 → 按 id 归并；无 id 的对象数组 → 按位置合并（保住已到达的正文）；否则替换 */
+  /**
+   * 带 id 的对象数组 → 按 id 归并；无 id 的对象数组 → 按位置合并（保住已到达的正文）；否则替换。
+   *
+   * 「空正文不许覆盖已有正文」（2026-09-21 实抓定性）：站点会用
+   *   {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"BRA",…}]}
+   * 这样一帧把答案**开头**内联下发，随后同类结构帧带着 `content:""` 再来一次。
+   * mergeDeep 对字符串是直接赋值，于是这段开头被抹平 —— 表现为"正文稳定丢开头 1~4 个字符、
+   * 后面全都齐"（实抓三例：BRAVO-9→VO-9、XRAY…→RAY…、BRAVO-ECHO-9→VO-ECHO-9）。
+   * 下面那条注释说的是同一类问题，但只在无 id 分支修了；这里是漏修的那一支。
+   * 站点不会真的把已渲染的正文清空回来，所以保长弃空是安全的。
+   */
+  function keepRicherContent(prev, incoming) {
+    if (!prev || typeof prev !== 'object' || !incoming || typeof incoming !== 'object') return incoming;
+    const a = prev.content; const b = incoming.content;
+    if (typeof a === 'string' && a && typeof b === 'string' && !b) {
+      return Object.assign({}, incoming, { content: a });
+    }
+    return incoming;
+  }
+
   function mergeArray(cur, incoming) {
     const objArr = (arr) => Array.isArray(arr) && arr.length > 0
       && arr.every((x) => x && typeof x === 'object');
@@ -135,7 +171,7 @@
       const byId = new Map(cur.map((x) => [x.id, x]));
       for (const item of incoming) {
         const prev = byId.get(item.id);
-        byId.set(item.id, prev && typeof prev === 'object' ? mergeDeep(Object.assign({}, prev), item) : item);
+        byId.set(item.id, prev && typeof prev === 'object' ? mergeDeep(Object.assign({}, prev), keepRicherContent(prev, item)) : item);
       }
       return [...byId.values()];
     }
@@ -143,9 +179,10 @@
       // 无 id 时若整体替换，结构帧会把已经到达的正文冲掉，因此按位置合并
       const out = cur.slice();
       for (let i = 0; i < incoming.length; i++) {
+        const src = keepRicherContent(out[i], incoming[i]);
         out[i] = out[i] && typeof out[i] === 'object'
-          ? mergeDeep(Object.assign({}, out[i]), incoming[i])
-          : incoming[i];
+          ? mergeDeep(Object.assign({}, out[i]), src)
+          : src;
       }
       return out;
     }

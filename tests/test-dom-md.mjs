@@ -12,8 +12,10 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
-const P = require(path.join(path.dirname(fileURLToPath(import.meta.url)), 'extension', 'content', 'dom-md.js'));
+const P = require(path.join(ROOT, 'extension', 'content', 'dom-md.js'));
 
 let pass = 0;
 let fail = 0;

@@ -16,11 +16,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(path.join(__dirname, 'server', 'index.mjs'));
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(path.join(ROOT, 'server', 'package.json'));
 const { WebSocketServer } = require('ws');
 
-const cliPath = path.join(__dirname, 'server', 'cli.mjs');
+const cliPath = path.join(ROOT, 'server', 'cli.mjs');
 let pass = 0;
 let fail = 0;
 const ok = (cond, name, extra = '') => {
@@ -30,7 +31,7 @@ const ok = (cond, name, extra = '') => {
 
 // ---------- [1] parseArgs ----------
 console.log('[1] parseArgs');
-const cli = await import('./server/cli.mjs');
+const cli = await import(pathToFileURL(cliPath).href);   // 与 cliPath 同一个来源，避免两处路径各说各话
 {
   const a = cli.parseArgs(['ask', 'deepseek', '你好', '--out', 'x.md', '--attach', 'a.js', '--attach', 'b.js', '--json']);
   ok(a.cmd === 'ask' && a.pos[0] === 'deepseek' && a.pos[1] === '你好', '位置参数与命令');
@@ -71,7 +72,7 @@ console.log('[2] buildPrompt（--attach / --prompt-file / 60KB 上限）');
 }
 
 // ---------- [3] stageOf / failLine ----------
-console.log('[3] 失败定位（七段 stage 与 FAIL 行契约）');
+console.log('[3] 失败定位（stage 分段与 FAIL 行契约）');
 {
   ok(cli.stageOf({ stage: 'queue' }) === 'queue', '扩展上报的 stage 优先透传');
   ok(cli.stageOf({ mdLen: 0, streamId: 's1' }) === 'retrieve', 'mdLen=0 且 streamId 有值 → retrieve');
@@ -124,7 +125,7 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'hello') {
-      if (msg.role === 'mcp' && msg.token === FAKE_TOKEN) ws.send(JSON.stringify({ type: 'hello-ok', role: 'mcp' }));
+      if (msg.role === 'cli' && msg.token === FAKE_TOKEN) ws.send(JSON.stringify({ type: 'hello-ok', role: 'cli' }));
       else ws.send(JSON.stringify({ type: 'hello-fail', error: '令牌不匹配' }));
       return;
     }
@@ -305,6 +306,20 @@ console.log('[7] continue / 协议校验 / doctor');
 {
   const { code, out } = await runCli(['bridge', 'stop']);
   ok(code === 0 && out.includes('不是本命令驻留的'), 'bridge stop：外部桥（fake 桥无记录）→ 提示 --force 不误杀');
+}
+
+console.log('[8] buildOptions：按调用指定开关（0.7.0 补，此前只有已删除的 MCP 入口能做）');
+{
+  const bo = cli.buildOptions;
+  ok(JSON.stringify(bo('deepseek', { '--think': 'off', '--search': 'on' })) === JSON.stringify({ deepThink: false, search: true }),
+    'deepseek --think off --search on → {deepThink:false,search:true}');
+  ok(bo('deepseek', {}) === null, '不给开关 → null（不干预页面状态）');
+  ok(bo('qwen', { '--mode': 'think' }).mode === 'think', 'qwen --mode think');
+  const bad = (fn) => { try { fn(); return false; } catch (e) { return e.code === 'usage'; } };
+  ok(bad(() => bo('deepseek', { '--think': 'maybe' })), '取值非法 → 用法错误（退出码 2）');
+  ok(bad(() => bo('qwen', { '--mode': 'yolo' })), 'qwen 非法模式 → 用法错误');
+  ok(bad(() => bo('qwen', { '--think': 'on' })), 'qwen 用 --think → 用法错误（串站了）');
+  ok(bad(() => bo('deepseek', { '--mode': 'fast' })), 'deepseek 用 --mode → 用法错误');
 }
 
 wss.close();

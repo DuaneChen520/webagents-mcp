@@ -5,10 +5,13 @@
   <title>WebAgents 设置</title>
   <style>
     :root { --accent: #4f6ef7; --bg: #f6f7fb; --card: #ffffff; --border: #e6e9f2; --text: #23283b; --sub: #8a91a8; }
-    body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 520px; margin: 40px auto; padding: 0 18px 20px; color: var(--text); background: var(--bg); }
+    /* 同一份页面既当工具栏浮窗又当完整设置页：显式宽度让 popup 自然收到 400px，
+       在标签页里则是一栏居中。曾有一份独立的 popup.html，与本页控件完全重复（各改一处就漂移，
+       「跑千问前请先授予」那句就是这么来的），0.7.0 起合并为单一份。 */
+    body { font-family: "Microsoft YaHei", system-ui, sans-serif; width: 400px; max-width: 100%; margin: 0 auto; padding: 14px 18px 16px; color: var(--text); background: var(--bg); }
     header { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
-    .logo { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(135deg, #4f6ef7, #8b5cf6); display: inline-flex; align-items: center; justify-content: center; color: #fff; font-size: 15px; font-weight: 700; }
-    h1 { font-size: 20px; margin: 0; }
+    .logo { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, #4f6ef7, #8b5cf6); display: inline-flex; align-items: center; justify-content: center; color: #fff; font-size: 13px; font-weight: 700; }
+    h1 { font-size: 17px; margin: 0; }
     .hint { color: var(--sub); font-size: 12px; margin: 6px 0 16px; line-height: 1.55; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(30,40,90,.05); }
     .card-title { font-weight: 600; font-size: 12px; color: var(--sub); letter-spacing: .5px; margin-bottom: 2px; }
@@ -24,11 +27,6 @@
     #save:hover { filter: brightness(1.08); }
     #status { color: #17a561; font-size: 13px; font-weight: 600; opacity: 0; transition: opacity .25s; }
     #status.show { opacity: 1; }
-    .perm-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .plain { background: #fff; border: 1px solid var(--border); border-radius: 9px; padding: 7px 16px; font-size: 13px; color: var(--text); cursor: pointer; font-family: inherit; transition: all .15s; }
-    .plain:hover { border-color: var(--accent); color: var(--accent); }
-    .state { font-size: 12px; color: var(--sub); }
-    .state.ok { color: #17a561; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -68,24 +66,6 @@
       <div class="seg" id="throttleSec">
         <button data-value="0">关闭</button><button data-value="3">3 秒</button><button data-value="8">8 秒</button><button data-value="20">20 秒</button>
       </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">备用输入通道（按需授权）</div>
-    <div class="row">
-      <div class="row-label">可信输入（chrome.debugger）</div>
-      <div class="perm-row">
-        <button id="grantDebug" class="plain">授予调试权限</button>
-        <button id="revokeDebug" class="plain">撤销</button>
-        <span id="debugState" class="state">检测中…</span>
-      </div>
-      <p class="hint" style="margin:10px 0 0">
-        如实说明：<b>当前两个站点都不依赖它</b>（千问走 execCommand insertText，DeepSeek 走原生 setter）。
-        保留它只是为了某天合成事件被站点封掉时能降级。
-        正因如此才改为按需授予 —— 不再为一个没接线的能力常驻显示「正在调试此浏览器」。
-        授予期间该提示条会出现，用完后扩展立即断开，只会短暂可见。
-      </p>
     </div>
   </div>
 

@@ -4,9 +4,9 @@
  *
  * 分级 fail-fast（2026-09-13）：
  *   stage='inject'           注入后 ≤3s 读回编辑器内容比对（最多尝试 2 次）
- *   stage='send'             触发发送后 ≤5s 确认等价信号（输入框清空/用户气泡出现）
+ *   stage='send'             触发发送后 ≤25s 确认等价信号（输入框清空/用户气泡出现）
  *   stage='no_site_feedback' 由 background 轮询 state（feedback/blocks 生命信号）判定，≤12s
- * 每级失败立即以 {ok:false, stage, detail} 回传 background → server → MCP，绝不静默挂起。
+ * 每级失败立即以 {ok:false, stage, detail} 回传 background → 桥 → CLI，绝不静默挂起。
  */
 /* eslint-disable no-undef */
 (() => {
@@ -408,6 +408,28 @@
       const text = (el.innerText || '').trim();
       if (text) out.markdownish.push({ tag: el.tagName, cls: String(el.className).slice(0, 140), text: text.slice(0, 100), visible: !!el.offsetParent });
     });
+    // 类名分布普查（2026-09-21 加）：答案区选择器失效时，按语义类名（markdown/answer）的扫描
+    // 会直接扫不到任何东西，于是 domLen 恒为 0、流正文失去唯一的交叉校验。
+    // 这里不再猜语义，改成统计站点自己的 ds-* 类名分布 + 每类的文本量级，用来重定选择器。
+    // 只在 inspect/probe 这条诊断路径上跑（不在 ask 的 600ms 轮询里），且限制访问节点数。
+    out.classTokens = {};
+    try {
+      const els = document.querySelectorAll('[class*="ds-"]');
+      const cap = Math.min(els.length, 600);
+      for (let i = 0; i < cap; i++) {
+        const el = els[i];
+        const text = (el.innerText || '').trim();
+        if (!text) continue;
+        for (const t of String(el.className || '').split(/\s+/)) {
+          if (!/^ds-/.test(t)) continue;
+          const rec = out.classTokens[t] || (out.classTokens[t] = { n: 0, maxLen: 0, sample: '' });
+          rec.n++;
+          if (text.length > rec.maxLen) { rec.maxLen = text.length; rec.sample = text.slice(0, 60); }
+        }
+      }
+      out.classScanned = cap;
+      out.classTotal = els.length;
+    } catch { /* 忽略 */ }
     // 回答块 HTML 头尾：结构问题（行号/工具栏/卡片标题混入正文）一次看穿。仅诊断用。
     // 头部看根节点类名（完成标记），尾部看代码块结构（表格卡片在前、代码在后，SVG 很占字符）。
     try {
@@ -544,8 +566,10 @@
               sendResponse({ ok: false, stage: 'send', detail: `发送动作(${how})后 25s 未见发送信号，输入框残留「${still}」` });
               return;
             }
-            // 回传首反馈判定基线：发送完成瞬间的回答块数与思考态指示器
-            sendResponse({ ok: true, sent: how, baseBlocks: blockCount(ADAPTER), baseFeedback: siteFeedback(ADAPTER) });
+            // 只回"发送动作"本身：SW 判完成靠的是自己的 askSince 基线，
+            // 早先一并回传的 baseBlocks/baseFeedback 在 SW 侧已无消费方（60a612b 清了读方），
+            // 留着只会让人以为这两个字段还有用。
+            sendResponse({ ok: true, sent: how });
           } catch (err) {
             sendResponse({ ok: false, stage, detail: err.message });
           }
@@ -634,7 +658,21 @@
               // 样本给到 1200 字符 —— 300 字符只够看到遥测头部，看不出正文形态（踩过）。
               frames: data.frames,
               rawTexts: data.rawTexts,
+              // 片段清单与站点自己的分段信号：判断"正文有没有归对片段"的直接证据
+              frags: data.frags,
+              pendingFragment: data.pendingFragment,
+              thinkingEnabled: data.thinkingEnabled,
+              fragmentCount: data.fragmentCount,
               sampleHead: String(data.sample || '').slice(0, 1200),
+              // 最前面几帧的原文：查"丢头"类问题的唯一直接证据（sample 只留尾部）
+              headFrames: String(data.headSample || '').slice(0, 1200),
+              // 思考→答案切换点的帧原文：分辨"增量被并进 THINK"与"帧根本没到"
+              answerStart: data.answerStart,
+              // 到达即记账：每个片段类型收过多少字正文增量（与 frags 的 len 对照即见丢头）
+              deltaByKind: data.deltaByKind,
+              pendingByKind: data.pendingByKind,
+              contentOps: data.contentOps,
+              noOpContentWrites: data.noOpContentWrites,
             } : null,
             // 本页全部流的摘要：判断"作答流到底有没有被抓到"的决定性证据
             streams: lastStreamsList,

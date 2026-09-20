@@ -55,7 +55,7 @@ node $WA ask deepseek "审查以下文件的数据流安全，输出问题清单
 
 1. 读 stdout 的 `FAIL stage=…` 行（O(1) 定位，见 references/cli.md 判定表）。
 2. 需要细节 → `runs --why last`。
-3. 需要看现场 → `inspect <site>`（只读；**永远不要用 probe 取现场**，它整页重载）。
+3. 需要看现场 → `inspect <site>`（只读，不导航；DOM 结构在它返回的 `data.probe` 里）。
 4. 确认是瞬时问题才重跑；结构性失败先跑 `doctor`（桥/扩展/令牌/版本/失败模式一次看清）。
 
 ## 剧本 6：多轮任务（调研 → 写作 → 审查，同一会话链）

@@ -18,8 +18,9 @@ import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(path.join(__dirname, 'server', 'index.mjs'));
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(path.join(ROOT, 'server', 'package.json'));
 const { WebSocket } = require('ws');
 
 const PORT = 8799;              // 独立端口，避免干扰正在使用的 8765
@@ -35,7 +36,7 @@ function check(name, actual, expected) {
   else { fail++; console.log(`  FAIL ${name}\n       实际: ${a}\n       期望: ${e}`); }
 }
 
-const child = spawn(process.execPath, [path.join(__dirname, 'server', 'bridge.mjs')], {
+const child = spawn(process.execPath, [path.join(ROOT, 'server', 'bridge.mjs')], {
   env: {
     ...process.env,
     WEBAGENTS_PORT: String(PORT),
@@ -80,11 +81,11 @@ function waitFor(ws, pred, timeoutMs = 4000) {
 
 console.log('\n[1] 启动 bridge 并握手');
 await sleep(600);
-let mcp = null;
+let cli = null;
 let ext = null;
 try {
-  mcp = await connect('mcp');
-  check('mcp 角色握手成功', !!mcp, true);
+  cli = await connect('cli');
+  check('cli 角色握手成功', !!cli, true);
   ext = await connect('ext');
   check('ext 角色握手成功', !!ext, true);
 } catch (e) {
@@ -95,14 +96,14 @@ try {
 console.log('\n[2] 正常转发（回归：别把正常路径改坏）');
 {
   const seen = waitFor(ext, (m) => m.type === 'request' && m.id === 'req-A');
-  mcp.send(JSON.stringify({ type: 'request', id: 'req-A', action: 'ping' }));
+  cli.send(JSON.stringify({ type: 'request', id: 'req-A', action: 'ping' }));
   const got = await seen;
   check('扩展侧收到转发请求', got && got.id, 'req-A');
-  // 扩展回包 → mcp 应收到
-  const back = waitFor(mcp, (m) => m.type === 'result' && m.id === 'req-A');
+  // 扩展回包 → cli 应收到
+  const back = waitFor(cli, (m) => m.type === 'result' && m.id === 'req-A');
   ext.send(JSON.stringify({ type: 'result', id: 'req-A', ok: true, data: { connected: true } }));
   const r = await back;
-  check('结果按 id 路由回 mcp', r && r.ok, true);
+  check('结果按 id 路由回 cli', r && r.ok, true);
 }
 
 console.log('\n[3] 瞬时抖动：断开后重连，在飞请求必须活着（不能被自己人杀掉）');
@@ -110,10 +111,10 @@ console.log('\n[3] 瞬时抖动：断开后重连，在飞请求必须活着（�
   // 背景：offscreen 文档重连、网络栈抖动都会造成秒级断开，而扩展侧 SW 仍在正常处理任务。
   // 旧实现一断就把在飞请求全部判死 —— 实测代价是"任何超过 60 秒的问答都会被自己杀死"。
   const seen = waitFor(ext, (m) => m.type === 'request' && m.id === 'req-B');
-  mcp.send(JSON.stringify({ type: 'request', id: 'req-B', action: 'ask' }));
+  cli.send(JSON.stringify({ type: 'request', id: 'req-B', action: 'ask' }));
   await seen;
 
-  const early = waitFor(mcp, (m) => m.type === 'result' && m.id === 'req-B', 12000);
+  const early = waitFor(cli, (m) => m.type === 'result' && m.id === 'req-B', 12000);
   ext.close();                        // 抖动
   await sleep(1000);
   const ext2 = await connect('ext');  // 1 秒后回来
@@ -121,7 +122,7 @@ console.log('\n[3] 瞬时抖动：断开后重连，在飞请求必须活着（�
   check('重连后 3 秒内没有被判失败', got === 'still-pending', true);
 
   // 结果从新连接回来 —— 必须能送达（这正是抖动场景下真实发生的事）
-  const delivered = waitFor(mcp, (m) => m.type === 'result' && m.id === 'req-B', 5000);
+  const delivered = waitFor(cli, (m) => m.type === 'result' && m.id === 'req-B', 5000);
   ext2.send(JSON.stringify({ type: 'result', id: 'req-B', ok: true, text: 'late-but-alive' }));
   const d = await delivered;
   check('结果可从新连接送达（旧实现这里会丢）', (d && d.text) || null, 'late-but-alive');
@@ -132,10 +133,10 @@ console.log('\n[3b] 扩展真的没了：宽限期后必须明确失败，不能
 {
   ext = await connect('ext');
   const seen = waitFor(ext, (m) => m.type === 'request' && m.id === 'req-B2');
-  mcp.send(JSON.stringify({ type: 'request', id: 'req-B2', action: 'ask' }));
+  cli.send(JSON.stringify({ type: 'request', id: 'req-B2', action: 'ask' }));
   await seen;
   const t0 = Date.now();
-  const pending = waitFor(mcp, (m) => m.type === 'result' && m.id === 'req-B2', 25000);
+  const pending = waitFor(cli, (m) => m.type === 'result' && m.id === 'req-B2', 25000);
   ext.close();                        // 断开且不再回来
   const r = await pending;
   const ms = Date.now() - t0;
@@ -147,8 +148,8 @@ console.log('\n[3b] 扩展真的没了：宽限期后必须明确失败，不能
 console.log('\n[4] 扩展不在线时的新请求 → 立即失败，不排队');
 {
   const t0 = Date.now();
-  mcp.send(JSON.stringify({ type: 'request', id: 'req-C', action: 'ask' }));
-  const r = await waitFor(mcp, (m) => m.type === 'result' && m.id === 'req-C');
+  cli.send(JSON.stringify({ type: 'request', id: 'req-C', action: 'ask' }));
+  const r = await waitFor(cli, (m) => m.type === 'result' && m.id === 'req-C');
   const ms = Date.now() - t0;
   check('立即返回失败', !!(r && r.ok === false), true);
   check('错误信息提示扩展未连接', /未连接/.test((r && r.error) || ''), true);
@@ -159,15 +160,15 @@ console.log('\n[5] 扩展重连后恢复可用（别改成一断就废）');
 {
   const ext2 = await connect('ext');
   const seen = waitFor(ext2, (m) => m.type === 'request' && m.id === 'req-D');
-  mcp.send(JSON.stringify({ type: 'request', id: 'req-D', action: 'ping' }));
+  cli.send(JSON.stringify({ type: 'request', id: 'req-D', action: 'ping' }));
   check('重连后请求可正常转发', !!(await seen), true);
-  const back = waitFor(mcp, (m) => m.type === 'result' && m.id === 'req-D');
+  const back = waitFor(cli, (m) => m.type === 'result' && m.id === 'req-D');
   ext2.send(JSON.stringify({ type: 'result', id: 'req-D', ok: true }));
   check('结果正常回传', !!((await back) || {}).ok, true);
   ext2.close();
 }
 
-try { mcp && mcp.close(); } catch { /* 忽略 */ }
+try { cli && cli.close(); } catch { /* 忽略 */ }
 child.kill();
 
 console.log(`\n结果：通过 ${pass} 项，失败 ${fail} 项\n`);

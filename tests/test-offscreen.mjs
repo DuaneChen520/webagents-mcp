@@ -13,8 +13,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(path.join(__dirname, 'extension', 'offscreen.js'), 'utf8');
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const src = readFileSync(path.join(ROOT, 'extension', 'offscreen.js'), 'utf8');
 
 let pass = 0;
 let fail = 0;
@@ -126,7 +127,7 @@ console.log('\n[6] 不属于自己的消息必须忽略（否则会跟 popup/内
 {
   const before = swCalls.length;
   let called = false;
-  const handled = swListener({ type: 'cdpClick', x: 1, y: 2 }, {}, () => { called = true; });
+  const handled = swListener({ type: 'stray-from-somewhere-else' }, {}, () => { called = true; });
   check('不处理、不应答', [handled, called], [false, false]);
   check('没有额外副作用', swCalls.length, before);
 }

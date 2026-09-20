@@ -1,0 +1,10 @@
+{
+  "name": "webagents",
+  "version": "0.7.0",
+  "private": true,
+  "description": "把 DeepSeek / 通义千问网页版聊天作为 subagent：Edge 扩展 + 本地 WS 桥 + CLI 原语",
+  "scripts": {
+    "test": "node tests/run-all.mjs",
+    "test:live": "node tests/run-all.mjs --live"
+  }
+}

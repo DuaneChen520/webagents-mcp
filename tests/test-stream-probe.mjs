@@ -12,8 +12,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const read = (p) => readFileSync(path.join(__dirname, p), 'utf8');
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const read = (p) => readFileSync(path.join(ROOT, p), 'utf8');
 
 // ---- 伪造 XMLHttpRequest ----
 class FakeXHR {

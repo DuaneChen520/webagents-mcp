@@ -12,31 +12,30 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(path.join(__dirname, 'extension', 'background.js'), 'utf8');
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const src = readFileSync(path.join(ROOT, 'extension', 'background.js'), 'utf8');
 
 // ---- 给 background.js 的顶层副作用打桩 ----
-class FakeWebSocket {
-  constructor() { this.readyState = 0; }
-  send() {}
-  close() {}
-}
 const noop = () => {};
 const fakeChrome = {
   alarms: { create: noop, onAlarm: { addListener: noop } },
-  runtime: { onMessage: { addListener: noop } },
-  debugger: { onDetach: { addListener: noop } },
+  runtime: { onMessage: { addListener: noop }, getURL: (p) => `chrome-extension://test/${p}` },
+  // 连接只由 offscreen 承载（SW 内直连那条退回分支已随 minimum_chrome_version:116 删除），
+  // 所以桩只需要"能建文档"这一件事。
+  offscreen: { createDocument: async () => {} },
   storage: { local: { get: async () => ({}), set: async () => {} } },
   tabs: {}, scripting: {},
 };
 
 // 把顶层作用域里的东西取出来（真实实现，零复制）
 const factory = new Function(
-  'chrome', 'WebSocket', 'setInterval', 'setTimeout', 'console',
+  'chrome', 'setTimeout', 'console',
   `${src}\n;return { enqueueSite, queueSnapshot, lastAskEndAt, DEFAULT_THROTTLE_SEC, QUEUE_WAIT_MS, TERMINAL_STATUS_TEXT, firstSignalBudget, ACKED_FIRST_SIGNAL_MS };`,
 );
-const api = factory(fakeChrome, FakeWebSocket, noop, setTimeout, console);
+const api = factory(fakeChrome, setTimeout, console);
 const { enqueueSite, queueSnapshot, lastAskEndAt, DEFAULT_THROTTLE_SEC, QUEUE_WAIT_MS, firstSignalBudget, ACKED_FIRST_SIGNAL_MS } = api;
+
 
 let pass = 0;
 let fail = 0;
@@ -120,6 +119,25 @@ console.log('\n[8] 首反馈预算：只在"发送无法确认"时才严格');
   check('ack 确认 → 放宽到 25s', firstSignalBudget(true, 12000), ACKED_FIRST_SIGNAL_MS);
   check('站点自带值更宽时不反而收紧（千问 30s）', firstSignalBudget(true, 30000), 30000);
   check('站点自带值更宽时 ack 丢失也不收紧', firstSignalBudget(false, 30000), 30000);
+}
+
+console.log('\n[9] content 往返必须带硬超时（2026-09-21 实测卡死后补）');
+{
+  // 挂死现场：内容脚本的监听器无条件 return true，若它内部抛了却没走到 sendResponse，
+  // chrome.tabs.sendMessage 的 Promise 永不 settle —— 挂住的不是"这一轮轮询"，
+  // 而是整个 ask 任务与该站点的串行队列（status 里表现为该站点排队深度长期不减）。
+  const mk = (tabs) => new Function('chrome', 'setTimeout', 'console',
+    `${src};return { tabsCall };`)({ ...fakeChrome, tabs }, setTimeout, console);
+
+  let outcome = 'pending';
+  await mk({ sendMessage: () => new Promise(() => {}) })      // 对端永远不回话
+    .tabsCall(1, { type: 'state' }, 150)
+    .then(() => { outcome = 'resolved'; }, () => { outcome = 'rejected'; });
+  check('对端永不回应 → 按时抛错（而不是永远挂着）', outcome, 'rejected');
+
+  const r = await mk({ sendMessage: () => Promise.resolve({ ok: true }) })
+    .tabsCall(1, { type: 'state' }, 500);
+  check('正常应答原样返回', r && r.ok, true);
 }
 
 console.log(`\n结果：通过 ${pass} 项，失败 ${fail} 项\n`);

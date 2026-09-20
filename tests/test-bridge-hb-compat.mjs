@@ -14,8 +14,9 @@ import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(path.join(__dirname, 'server', 'index.mjs'));
+// 测试住在 tests/ 下：ROOT = 仓库根（被测代码在 server/ 与 extension/）
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(path.join(ROOT, 'server', 'package.json'));
 const { WebSocket } = require('ws');
 
 const PORT = 8797;
@@ -26,7 +27,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let fail = 0;
 const check = (name, ok, note) => { console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${name}${note ? '  ' + note : ''}`); if (!ok) fail++; };
 
-const child = spawn(process.execPath, [path.join(__dirname, 'server', 'bridge.mjs')], {
+const child = spawn(process.execPath, [path.join(ROOT, 'server', 'bridge.mjs')], {
   env: {
     ...process.env, WEBAGENTS_PORT: String(PORT), WEBAGENTS_TOKEN: TOKEN, WEBAGENTS_HB_MS: String(HB),
     WEBAGENTS_HOME: path.join(os.tmpdir(), 'webagents-test-hbcompat'),
@@ -52,7 +53,7 @@ try {
   const ext = await legacyExt();
   const cli = await new Promise((res, rej) => {
     const ws = new WebSocket(URL);
-    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', role: 'mcp', token: TOKEN })));
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', role: 'cli', token: TOKEN })));
     ws.on('message', () => res(ws));
     ws.on('error', rej);
     setTimeout(() => rej(new Error('hello 超时')), 4000);

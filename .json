@@ -1,0 +1,1 @@
+{"required":["food","protein_g","kcal"],"properties":{"food":"string","protein_g":"number","kcal":"number"}}
